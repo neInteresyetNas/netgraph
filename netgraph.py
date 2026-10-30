@@ -248,6 +248,20 @@ def world_json():
     return None
 
 
+def gateway_ip():
+    """Адрес шлюза по умолчанию (обычно это и есть роутер)."""
+    for cmd, rx in ((["route", "-n", "get", "default"], r'gateway:\s*(\S+)'),
+                    (["ip", "route", "show", "default"], r'via\s+(\S+)')):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+            m = re.search(rx, out)
+            if m:
+                return str(ipaddress.ip_address(m.group(1).split('%')[0]))
+        except Exception:
+            continue
+    return ""
+
+
 def loop():
     prev, pb, pt = None, {}, time.time()
     while True:
@@ -406,6 +420,8 @@ class H(BaseHTTPRequestHandler):
                                        geo_on=ARGS.geo, geo_pending=geo_state["pending"], geo_err=geo_state["err"],
                                        demo=ARGS.demo)).encode()
             self._send(body, "application/json")
+        elif path == "/gateway":
+            self._send(json.dumps(dict(ip="192.168.1.1" if ARGS.demo else gateway_ip())).encode(), "application/json")
         elif path == "/world.json":
             data = world_json()
             if data is None:
@@ -581,16 +597,40 @@ aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--
 
 /* карта */
 #m .ocean{fill:url(#ocean);stroke:rgba(255,255,255,.12);stroke-width:1;vector-effect:non-scaling-stroke}
-#m .grat{fill:none;stroke:rgba(255,255,255,.05);stroke-width:.7;vector-effect:non-scaling-stroke}
-#m .land{fill:#222a40;stroke:#3a4766;stroke-width:.6;stroke-linejoin:round;vector-effect:non-scaling-stroke}
-#m .arc{fill:none;stroke:var(--acc);stroke-opacity:.6;stroke-width:1.2;stroke-dasharray:4 6;animation:flow 1.1s linear infinite;vector-effect:non-scaling-stroke}
-#m .dot{fill:var(--wan);stroke:#06141a;stroke-width:1.4;vector-effect:non-scaling-stroke;cursor:pointer}
-#m .pulse{fill:var(--wan);transform-box:fill-box;transform-origin:center;animation:pulse 2.6s ease-out infinite;pointer-events:none}
+#m .grat,#gl .grat{fill:none;stroke:rgba(255,255,255,.05);stroke-width:.7;vector-effect:non-scaling-stroke}
+#m .land,#gl .land{fill:#222a40;stroke:#3a4766;stroke-width:.6;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+#m .arc,#gl .arc{fill:none;stroke:var(--acc);stroke-opacity:.6;stroke-width:1.2;stroke-dasharray:4 6;animation:flow 1.1s linear infinite;vector-effect:non-scaling-stroke}
+#m .dot,#gl .dot{fill:var(--wan);stroke:#06141a;stroke-width:1.4;vector-effect:non-scaling-stroke;cursor:pointer}
+#m .pulse,#gl .pulse{fill:var(--wan);transform-box:fill-box;transform-origin:center;animation:pulse 2.6s ease-out infinite;pointer-events:none}
 @keyframes pulse{0%{transform:scale(.7);opacity:.55}100%{transform:scale(2.8);opacity:0}}
-#m .me-dot{fill:#fff;stroke:var(--acc);stroke-width:2;vector-effect:non-scaling-stroke}
-#m .me-ring{fill:none;stroke:#fff;stroke-width:1;vector-effect:non-scaling-stroke;transform-box:fill-box;transform-origin:center;animation:pulse 2.6s ease-out infinite}
-#m text{fill:#fff;font-weight:650;text-anchor:middle;paint-order:stroke;stroke:#0a0d14;stroke-width:3px;pointer-events:none}
+#m .me-dot,#gl .me-dot{fill:#fff;stroke:var(--acc);stroke-width:2;vector-effect:non-scaling-stroke}
+#m .me-ring,#gl .me-ring{fill:none;stroke:#fff;stroke-width:1;vector-effect:non-scaling-stroke;transform-box:fill-box;transform-origin:center;animation:pulse 2.6s ease-out infinite}
+#m text,#gl text{fill:#fff;font-weight:650;text-anchor:middle;paint-order:stroke;stroke:#0a0d14;stroke-width:3px;pointer-events:none}
 
+#gl .land{fill:#2a3a60;stroke:#4d6193;stroke-width:.5}
+#gl .grat{stroke:rgba(255,255,255,.07)}
+svg.alllbl .lbl.r{opacity:.92}
+#settings{position:absolute;top:64px;right:14px;width:340px;max-height:calc(100% - 90px);overflow:auto;z-index:8;padding:6px 0 12px}
+.st-h{display:flex;justify-content:space-between;align-items:center;padding:12px 16px 2px;font-size:15px}
+.st-h button{background:none;border:0;color:var(--tx3);font-size:22px;cursor:pointer;line-height:1}
+.st-h button:hover{color:var(--tx)}
+.st-s{font-size:10.5px;font-weight:650;letter-spacing:.09em;text-transform:uppercase;color:var(--tx3);padding:16px 16px 6px}
+.st-r{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 16px}
+.st-r>span{color:var(--tx2)}
+.sw{position:relative;width:38px;height:22px;flex:none}
+.sw input{position:absolute;opacity:0;inset:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:1}
+.sw i{position:absolute;inset:0;border-radius:11px;background:rgba(255,255,255,.13);transition:.18s}
+.sw i::after{content:"";position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.18s}
+.sw input:checked+i{background:var(--acc)}
+.sw input:checked+i::after{transform:translateX(16px)}
+.sw input:focus-visible+i{box-shadow:0 0 0 3px rgba(167,139,250,.35)}
+.sw input:disabled+i{opacity:.4}
+.seg.mini{height:30px;padding:2px;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:10px}
+.seg.mini button{padding:0 11px;font-size:12px;border-radius:8px}
+.router{margin:4px 16px 0;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--tx2);font-size:12.5px}
+.router b{color:var(--tx)}
+.router p{margin:8px 0 0}
+.router .btn{display:inline-block;margin-top:10px;text-decoration:none;font-size:12.5px;padding:8px 14px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 @media (max-width:860px){#app{flex-direction:column}aside{width:auto;height:42%;border-left:0;border-top:1px solid var(--line)}#stats{top:112px}.stat.sp{display:none}}
 </style></head>
@@ -599,6 +639,7 @@ aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--
 <main id="stage">
  <svg id="g" class="cv"></svg>
  <svg id="m" class="cv" style="display:none"></svg>
+ <svg id="gl" class="cv" style="display:none"></svg>
 
  <div id="top">
   <div class="glass brand">
@@ -614,6 +655,7 @@ aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--
   <button class="glass chip on" id="grp" title="Объединять хосты по домену второго уровня">Домены</button>
   <button class="glass chip" id="loc" title="Показывать соединения через localhost">localhost</button>
   <button class="glass chip" id="pause" title="Заморозить обновление (P)"><svg class="i" id="pi" viewBox="0 0 24 24"><rect x="6" y="4.5" width="4" height="15" rx="1"/><rect x="14" y="4.5" width="4" height="15" rx="1"/></svg><span>Пауза</span></button>
+  <button class="glass chip" id="cog" title="Настройки (S)"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M21 18h-1"/><circle cx="16" cy="6" r="2.2"/><circle cx="10" cy="12" r="2.2"/><circle cx="18" cy="18" r="2.2"/></svg><span>Настройки</span></button>
  </div>
 
  <div id="stats" class="glass">
@@ -631,7 +673,7 @@ aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--
  </div>
  <div id="mapleg" class="glass leg" style="display:none">
   <span><i style="background:var(--me)"></i>Этот Mac</span><span><i style="background:var(--wan)"></i>серверы</span>
-  <span id="mapstat" class="dim"></span><button id="geooff" hidden>выключить геолокацию</button>
+  <span id="mapstat" class="dim"></span><button id="mapmode">плоская карта</button><button id="geooff" hidden>выключить геолокацию</button>
  </div>
 
  <div id="zoomctl" class="glass">
@@ -640,6 +682,22 @@ aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--
   <button id="zfit" title="Вписать (F)"><svg class="i" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
  </div>
 
+ <div id="settings" class="glass" hidden>
+  <div class="st-h"><b>Настройки</b><button id="st-x" title="Закрыть">×</button></div>
+  <div class="st-s">Карта</div>
+  <div class="st-r"><span>Вид</span><div class="seg mini"><button id="m-globe">3D глобус</button><button id="m-flat">Плоская</button></div></div>
+  <div class="st-r"><span>Автовращение глобуса</span><label class="sw"><input type="checkbox" id="c-rot"><i></i></label></div>
+  <div class="st-r"><span>Геолокация IP (ip-api.com)</span><label class="sw"><input type="checkbox" id="c-geo"><i></i></label></div>
+  <div class="st-s">Граф</div>
+  <div class="st-r"><span>Группировать хосты по домену</span><label class="sw"><input type="checkbox" id="c-grp" checked><i></i></label></div>
+  <div class="st-r"><span>Показывать localhost</span><label class="sw"><input type="checkbox" id="c-loc"><i></i></label></div>
+  <div class="st-r"><span>Подписи всех узлов</span><label class="sw"><input type="checkbox" id="c-lbl"><i></i></label></div>
+  <div class="st-r"><span>Обновление данных</span><div class="seg mini"><button id="iv-1000">1 с</button><button id="iv-2000">2 с</button><button id="iv-5000">5 с</button></div></div>
+  <div class="st-s">Wi-Fi роутера</div>
+  <div class="router"><b>GPON-терминал MA670V3</b> (Photonspeak / Dragon Path GP700)<br>Адрес: <span class="mono" id="rt-ip">…</span>
+   <p>Менять имя и пароль Wi-Fi из NetGraph пока нельзя: у этой модели нет документированного интерфейса, а запись вслепую может оставить вас без Wi-Fi и интернета. Откройте админку и поменяйте их в разделе WLAN / Wi-Fi.</p>
+   <a class="btn" id="rt-open" target="_blank" rel="noopener" hidden>Открыть админку роутера</a></div>
+ </div>
  <div id="mapcard" class="glass card" hidden></div>
  <div id="splash" class="glass card" hidden></div>
  <div id="tip"></div>
@@ -695,6 +753,9 @@ const empty=(ic,t,s)=>`<div class="empty"><div class="ic">${ICON[ic]}</div><div 
 let data=null,view='g',tab='node',paused=false,sel=null,hov=null,firstFit=false;
 const flt={grp:true,loc:false};
 const tp=[];
+const cfg=Object.assign({mode:'globe',rotate:true,labels:false,interval:2000},(()=>{try{return JSON.parse(localStorage.getItem('ng-cfg')||'{}')}catch(e){return{}}})());
+const saveCfg=()=>{try{localStorage.setItem('ng-cfg',JSON.stringify(cfg))}catch(e){}};
+function showMapSvg(){$('m').style.display=view==='m'&&cfg.mode==='flat'?'':'none';$('gl').style.display=view==='m'&&cfg.mode==='globe'?'':'none'}
 
 /* ── тултип ── */
 const tip=$('tip');
@@ -884,7 +945,7 @@ async function loadWorld(force){
  const srcs=['/world.json','https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json','https://unpkg.com/world-atlas@2.0.2/countries-110m.json'];
  for(const u of srcs){
   try{const r=await fetch(u);if(!r.ok)continue;const t=await r.json();
-   landFC=topoFeature(t,t.objects.countries);worldState='ok';mapLayout();data&&drawMap(data);return}catch(e){}
+   landFC=topoFeature(t,t.objects.countries);worldState='ok';if(cfg.mode==='flat')mapLayout();data&&drawMap(data);return}catch(e){}
  }
  worldState='fail';data&&drawMap(data);
 }
@@ -902,9 +963,7 @@ async function setGeo(on){try{await fetch('/geo',{method:'POST',headers:{'Conten
 $('geooff').onclick=()=>setGeo(false);
 $('mapcard').addEventListener('click',e=>{if(e.target.closest('#geo-on'))setGeo(true);if(e.target.closest('#world-retry')){worldState='idle';loadWorld()}});
 
-function drawMap(d){
- try{
- if(!mproj&&!mapLayout())return;
+function geoModel(d){
  const q=$('q').value.trim().toLowerCase(),wan=new Set(),loc=new Set(),pts=new Map();
  d.conns.forEach(c=>{
   if(c.kind!=='wan')return;
@@ -914,18 +973,89 @@ function drawMap(d){
   if(!p){p={key:k,g,n:0,names:new Set(),procs:new Set()};pts.set(k,p)}
   p.n++;p.names.add(c.host||c.rip);p.procs.add(c.proc)});
  const arr=[...pts.values()];arr.forEach(p=>p.r=4+Math.sqrt(p.n)*1.7);
- const me=d.me&&d.me.lat!=null?[d.me.lon,d.me.lat]:null;
+ return {q,wan,loc,arr,me:d.me&&d.me.lat!=null?[d.me.lon,d.me.lat]:null};
+}
+const ptTip=(e,p)=>showTip(e,`<b>${flag(p.g.countryCode)} ${esc(p.g.city||p.g.country||'')}${p.g.city?', '+esc(p.g.country):''}</b><div class="dim">${esc(p.g.org||'')}</div><div>${[...p.names].slice(0,4).map(esc).join('<br>')}</div><div class="dim">${[...p.procs].slice(0,5).map(esc).join(', ')} · ${p.n} соед.</div>`);
+const ptJoin=(layer,arr)=>{
+ const P=layer.selectAll('g.pt').data(arr,p=>p.key).join(e=>{const g=e.append('g').attr('class','pt');g.append('circle').attr('class','pulse');g.append('circle').attr('class','dot');return g});
+ P.select('.dot').on('mouseover',ptTip).on('mousemove',moveTip).on('mouseout',hideTip);return P};
+const meJoin=(layer,me)=>layer.selectAll('g.me').data(me?[me]:[]).join(e=>{const g=e.append('g').attr('class','me');g.append('circle').attr('class','me-ring');g.append('circle').attr('class','me-dot');g.append('text').text('Вы');return g});
 
+/* плоская карта */
+function drawFlat(arr,me){
  gArcs.selectAll('path').data(me?arr:[],p=>p.key).join('path').attr('class','arc')
   .attr('d',p=>mpath({type:'LineString',coordinates:[me,[p.g.lon,p.g.lat]]}));
- const P=gPts.selectAll('g.pt').data(arr,p=>p.key).join(e=>{
-  const g=e.append('g').attr('class','pt');g.append('circle').attr('class','pulse');g.append('circle').attr('class','dot');return g});
- P.attr('transform',p=>{const xy=mproj([p.g.lon,p.g.lat]);return `translate(${xy[0]},${xy[1]})`});
- P.select('.dot').on('mouseover',(e,p)=>showTip(e,`<b>${flag(p.g.countryCode)} ${esc(p.g.city||p.g.country||'')}${p.g.city?', '+esc(p.g.country):''}</b><div class="dim">${esc(p.g.org||'')}</div><div>${[...p.names].slice(0,4).map(esc).join('<br>')}</div><div class="dim">${[...p.procs].slice(0,5).map(esc).join(', ')} · ${p.n} соед.</div>`))
-  .on('mousemove',moveTip).on('mouseout',hideTip);
- const M=gMe.selectAll('g.me').data(me?[me]:[]).join(e=>{const g=e.append('g').attr('class','me');g.append('circle').attr('class','me-ring');g.append('circle').attr('class','me-dot');g.append('text').text('Вы');return g});
- M.attr('transform',m=>{const xy=mproj(m);return `translate(${xy[0]},${xy[1]})`});
+ ptJoin(gPts,arr).attr('transform',p=>{const xy=mproj([p.g.lon,p.g.lat]);return `translate(${xy[0]},${xy[1]})`});
+ meJoin(gMe,me).attr('transform',m=>{const xy=mproj(m);return `translate(${xy[0]},${xy[1]})`});
  markScale();
+}
+
+/* 3D-глобус */
+const gsvg=d3.select('#gl'),gd=gsvg.append('defs');
+const gstop=(g,o,c,a)=>g.append('stop').attr('offset',o).attr('stop-color',c).attr('stop-opacity',a);
+const sg=gd.append('radialGradient').attr('id','sphere').attr('cx','38%').attr('cy','30%').attr('r','85%');
+gstop(sg,'0%','#24376a',1);gstop(sg,'55%','#0f1a36',1);gstop(sg,'100%','#050813',1);
+const ag=gd.append('radialGradient').attr('id','atmo');
+gstop(ag,'76%','#7aa2ff',0);gstop(ag,'86%','#7aa2ff',.38);gstop(ag,'100%','#7aa2ff',0);
+const hg=gd.append('radialGradient').attr('id','shade').attr('cx','36%').attr('cy','28%').attr('r','82%');
+gstop(hg,'0%','#fff',.14);gstop(hg,'42%','#fff',0);gstop(hg,'78%','#000',.28);gstop(hg,'100%','#000',.62);
+const glSt=gsvg.append('g'),glAtmo=gsvg.append('circle').attr('fill','url(#atmo)').style('pointer-events','none'),
+ glSph=gsvg.append('circle').attr('fill','url(#sphere)').attr('stroke','rgba(150,180,255,.3)'),
+ glGr=gsvg.append('path').attr('class','grat').attr('fill','none'),glLd=gsvg.append('path').attr('class','land'),
+ glSh=gsvg.append('circle').attr('fill','url(#shade)').style('pointer-events','none'),
+ glA=gsvg.append('g'),glP=gsvg.append('g'),glM=gsvg.append('g');
+const gproj=d3.geoOrthographic().clipAngle(90).precision(.5),grat10=d3.geoGraticule10();
+let gk=1,rot=[-30,-20,0],rotInit=false,dragging=false,lastInt=0,glMe=null,glStFor='';
+const homeRot=m=>[-m[0],-m[1]*.8-4,0];
+function arcPath(a,b){
+ const ip=d3.geoInterpolate(a,b),alt=Math.min(.42,.07+d3.geoDistance(a,b)*.2),c=gproj.translate(),ctr=[-rot[0],-rot[1]];
+ let d='',pen=false;const N=44;
+ for(let i=0;i<=N;i++){
+  const t=i/N,pt=ip(t);
+  if(d3.geoDistance(pt,ctr)>1.54){pen=false;continue}
+  const xy=gproj(pt);if(!xy){pen=false;continue}
+  const k=1+alt*Math.sin(Math.PI*t);
+  d+=(pen?'L':'M')+(c[0]+(xy[0]-c[0])*k).toFixed(1)+','+(c[1]+(xy[1]-c[1])*k).toFixed(1);pen=true}
+ return d||null}
+function frameGlobe(){
+ const r=$('gl').getBoundingClientRect();if(r.width<50||r.height<50)return;
+ const R=Math.min(r.width-80,r.height-210)*.5*gk,cx=r.width/2,cy=r.height/2+42;
+ gproj.translate([cx,cy]).scale(Math.max(R,40)).rotate(rot);
+ const path=d3.geoPath(gproj),ctr=[-rot[0],-rot[1]],Rr=gproj.scale();
+ const key=Math.round(r.width)+'x'+Math.round(r.height);
+ if(glStFor!==key){glStFor=key;const rnd=d3.randomLcg(42);
+  glSt.selectAll('circle').data(d3.range(130)).join('circle').attr('cx',()=>rnd()*r.width).attr('cy',()=>rnd()*r.height).attr('r',()=>.4+rnd()*1.1).attr('fill','#fff').attr('opacity',()=>.08+rnd()*.5)}
+ glAtmo.attr('cx',cx).attr('cy',cy).attr('r',Rr*1.17);
+ glSph.attr('cx',cx).attr('cy',cy).attr('r',Rr);glSh.attr('cx',cx).attr('cy',cy).attr('r',Rr);
+ glGr.attr('d',path(grat10));if(landFC)glLd.attr('d',path(landFC));
+ const place=function(lonlat){const sel=d3.select(this);
+  const vis=d3.geoDistance(lonlat,ctr)<1.52,xy=vis&&gproj(lonlat);
+  sel.attr('display',xy?null:'none');if(xy)sel.attr('transform',`translate(${xy[0]},${xy[1]})`)};
+ glP.selectAll('g.pt').each(function(p){place.call(this,[p.g.lon,p.g.lat])});
+ glM.selectAll('g.me').each(function(m){place.call(this,m)});
+ glA.selectAll('path').attr('d',p=>glMe?arcPath(glMe,[p.g.lon,p.g.lat]):null);
+}
+function drawGlobe(arr,me){
+ glMe=me;if(me&&!rotInit){rot=homeRot(me);rotInit=true}
+ glA.selectAll('path').data(me?arr:[],p=>p.key).join('path').attr('class','arc');
+ const P=ptJoin(glP,arr);P.select('.dot').attr('r',p=>p.r);P.select('.pulse').attr('r',p=>p.r);
+ const M=meJoin(glM,me);M.select('.me-dot').attr('r',6);M.select('.me-ring').attr('r',6);M.select('text').attr('dy',-13).style('font-size','11.5px');
+ frameGlobe();
+}
+gsvg.call(d3.drag().on('start',()=>{dragging=true;lastInt=Date.now();hideTip()})
+ .on('drag',e=>{rot[0]+=e.dx*.3/gk;rot[1]=Math.max(-88,Math.min(88,rot[1]-e.dy*.3/gk));lastInt=Date.now();frameGlobe()})
+ .on('end',()=>{dragging=false;lastInt=Date.now()}));
+gsvg.on('wheel',e=>{e.preventDefault();gk=Math.max(.6,Math.min(3.2,gk*(e.deltaY<0?1.1:.91)));lastInt=Date.now();frameGlobe()},{passive:false});
+(function spin(){
+ if(view==='m'&&cfg.mode==='globe'&&cfg.rotate&&!dragging&&!paused&&!document.hidden&&Date.now()-lastInt>2500){rot[0]+=.07;frameGlobe()}
+ requestAnimationFrame(spin)})();
+
+function drawMap(d){
+ try{
+ const flat=cfg.mode==='flat';
+ if(flat&&!mproj&&!mapLayout())return;
+ const {q,wan,loc,arr,me}=geoModel(d);
+ flat?drawFlat(arr,me):drawGlobe(arr,me);
 
  /* состояние и подсказки */
  const countries=new Set(arr.map(p=>p.g.country));
@@ -966,34 +1096,34 @@ function setTab(t){tab=t;document.querySelectorAll('.tab').forEach(b=>b.classLis
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.t));
 
 function setView(v){
- view=v;$('g').style.display=v==='g'?'':'none';$('m').style.display=v==='m'?'':'none';
+ view=v;$('g').style.display=v==='g'?'':'none';showMapSvg();
  stage.classList.toggle('map',v==='m');$('vg').classList.toggle('on',v==='g');$('vm').classList.toggle('on',v==='m');
  $('legend').style.display=v==='g'?'':'none';$('mapleg').style.display=v==='m'?'':'none';
  hideTip();
- if(v==='m'){sim.stop();loadWorld();mapLayout();data&&drawMap(data);setTab('geo')}
+ if(v==='m'){sim.stop();loadWorld();if(cfg.mode==='flat')mapLayout();data&&drawMap(data);setTab('geo')}
  else{setCard('');data&&build(data);if(tab==='geo')setTab('node')}
 }
 $('vg').onclick=()=>setView('g');$('vm').onclick=()=>setView('m');
 const refresh=()=>{if(!data)return;view==='g'?build(data):drawMap(data)};
 $('q').addEventListener('input',refresh);
-$('grp').onclick=e=>{flt.grp=!flt.grp;e.currentTarget.classList.toggle('on',flt.grp);refresh()};
-$('loc').onclick=e=>{flt.loc=!flt.loc;e.currentTarget.classList.toggle('on',flt.loc);refresh()};
+const setFlag=(k,v)=>{flt[k]=v;$(k).classList.toggle('on',v);const c=$('c-'+k);if(c)c.checked=v;refresh()};
+$('grp').onclick=()=>setFlag('grp',!flt.grp);$('loc').onclick=()=>setFlag('loc',!flt.loc);
 $('pause').onclick=()=>{paused=!paused;$('pause').classList.toggle('on',paused);
  $('pause').querySelector('span').textContent=paused?'Продолжить':'Пауза';
  $('pi').innerHTML=paused?'<path d="M7 4.5l12 7.5-12 7.5z"/>':'<rect x="6" y="4.5" width="4" height="15" rx="1"/><rect x="14" y="4.5" width="4" height="15" rx="1"/>';
  if(!paused)refresh()};
-const zbtn=f=>()=>{const m=view==='g';(m?svg:msvg).transition().duration(250).call((m?zoom:mZoom).scaleBy,f)};
+const zbtn=f=>()=>{if(view==='g')svg.transition().duration(250).call(zoom.scaleBy,f);else if(cfg.mode==='flat')msvg.transition().duration(250).call(mZoom.scaleBy,f);else{gk=Math.max(.6,Math.min(3.2,gk*f));frameGlobe()}};
 $('zin').onclick=zbtn(1.5);$('zout').onclick=zbtn(1/1.5);
-$('zfit').onclick=()=>view==='g'?fit():msvg.transition().duration(500).call(mZoom.transform,d3.zoomIdentity);
+$('zfit').onclick=()=>{if(view==='g')fit();else if(cfg.mode==='flat')msvg.transition().duration(500).call(mZoom.transform,d3.zoomIdentity);else{gk=1;if(glMe)rot=homeRot(glMe);frameGlobe()}};
 document.addEventListener('keydown',e=>{
  if(e.target.tagName==='INPUT'){if(e.key==='Escape'){e.target.value='';e.target.blur();refresh()}return}
  if(e.metaKey||e.ctrlKey||e.altKey)return;
  if(e.key==='/'){e.preventDefault();$('q').focus()}
  else if(e.key==='g')setView('g');else if(e.key==='m')setView('m');
  else if(e.key==='p')$('pause').click();else if(e.key==='f')$('zfit').click();
- else if(e.key==='Escape')select(null);
+ else if(e.key==='s')toggleSettings();else if(e.key==='Escape'){select(null);toggleSettings(false)}
 });
-new ResizeObserver(()=>{if(view==='m'&&mapLayout()&&data)drawMap(data)}).observe(stage);
+new ResizeObserver(()=>{if(view!=='m')return;if(cfg.mode==='flat'){if(mapLayout()&&data)drawMap(data)}else frameGlobe()}).observe(stage);
 
 /* HUD */
 const sp=d3.select('#spark'),spA=sp.select('.sp-a'),spD=sp.select('.sp-d'),spU=sp.select('.sp-u');
@@ -1040,6 +1170,7 @@ $('pane-hist').addEventListener('click',e=>{const b=e.target.closest('[data-h]')
 async function poll(){
  try{
   data=await (await fetch('/data')).json();setLive(true);
+  const cg=$('c-geo');if(document.activeElement!==cg)cg.checked=!!data.geo_on;cg.disabled=!!data.demo;
   hud(data);alertsUI(data.alerts);eventsUI(data.events);
   if(!paused){
    if(view==='g'){build(data);if(!firstFit&&nodes.length>1){firstFit=true;setTimeout(()=>fit(),1400)}}
@@ -1048,8 +1179,30 @@ async function poll(){
  }catch(e){setLive(false);console.error(e)}
 }
 details();eventsUI([]);alertsUI([]);
-poll();setInterval(poll,2000);setInterval(()=>{if(tab==='hist')loadHistory()},15000);
-window.__ng={setView,select,setTab,fit};
+(async function pollLoop(){await poll();setTimeout(pollLoop,cfg.interval)})();setInterval(()=>{if(tab==='hist')loadHistory()},15000);
+/* ── настройки ── */
+const stp=$('settings');
+function syncCfg(){
+ $('m-globe').classList.toggle('on',cfg.mode==='globe');$('m-flat').classList.toggle('on',cfg.mode==='flat');
+ $('c-rot').checked=cfg.rotate;$('c-lbl').checked=cfg.labels;svg.classed('alllbl',cfg.labels);
+ [1000,2000,5000].forEach(v=>$('iv-'+v).classList.toggle('on',cfg.interval===v));
+ $('mapmode').textContent=cfg.mode==='globe'?'плоская карта':'3D глобус';
+}
+function setMode(m){cfg.mode=m;saveCfg();syncCfg();showMapSvg();if(view==='m'){if(m==='flat')mapLayout();data&&drawMap(data)}}
+$('m-globe').onclick=()=>setMode('globe');$('m-flat').onclick=()=>setMode('flat');
+$('mapmode').onclick=()=>setMode(cfg.mode==='globe'?'flat':'globe');
+$('c-rot').onchange=e=>{cfg.rotate=e.target.checked;saveCfg()};
+$('c-lbl').onchange=e=>{cfg.labels=e.target.checked;saveCfg();syncCfg()};
+$('c-grp').onchange=e=>setFlag('grp',e.target.checked);$('c-loc').onchange=e=>setFlag('loc',e.target.checked);
+$('c-geo').onchange=e=>setGeo(e.target.checked);
+[1000,2000,5000].forEach(v=>$('iv-'+v).onclick=()=>{cfg.interval=v;saveCfg();syncCfg()});
+let gwLoaded=false;
+async function loadGw(){try{const g=await (await fetch('/gateway')).json();gwLoaded=true;
+ $('rt-ip').textContent=g.ip||'не определён';if(g.ip){$('rt-open').href='http://'+g.ip;$('rt-open').hidden=false}}catch(e){}}
+function toggleSettings(on){stp.hidden=on===undefined?!stp.hidden:!on;$('cog').classList.toggle('on',!stp.hidden);if(!stp.hidden&&!gwLoaded)loadGw()}
+$('cog').onclick=()=>toggleSettings();$('st-x').onclick=()=>toggleSettings(false);
+syncCfg();
+window.__ng={setView,select,setTab,fit,setMode,toggleSettings};
 })();
 </script></body></html>"""
 
