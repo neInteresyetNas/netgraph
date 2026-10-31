@@ -10,14 +10,15 @@
   --demo   демо-данные без lsof/nettop — удобно посмотреть интерфейс
 """
 import subprocess, re, json, time, threading, socket, webbrowser, collections, ipaddress
-import sqlite3, os, sys, argparse, urllib.request, urllib.parse, random, math
+import sqlite3, os, sys, argparse, urllib.request, urllib.parse, urllib.error, random, math, base64, http.cookiejar, csv, io
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
 PORT = 8765
 LSOF = re.compile(r'^(\S+)\s+(\d+)\s+(\S+)\s+\S+\s+(IPv[46])\s+\S+\s+\S+\s+(TCP|UDP)\s+(.*)$')
 lock = threading.Lock()
-state = {"conns": [], "listen": [], "rates": {}}
+state = {"conns": [], "listen": [], "rates": {}, "totals": {}}
 events = collections.deque(maxlen=300)
 dns = {}
 pool = ThreadPoolExecutor(8)
@@ -35,7 +36,8 @@ DBL = threading.Lock()
 D = sqlite3.connect(os.path.join(HOME, "history.db"), check_same_thread=False)
 D.executescript("""CREATE TABLE IF NOT EXISTS pairs(proc TEXT,remote TEXT,first REAL,last REAL,n INT,PRIMARY KEY(proc,remote));
 CREATE TABLE IF NOT EXISTS log(t REAL,s TEXT,proc TEXT,remote TEXT,port TEXT);
-CREATE INDEX IF NOT EXISTS lt ON log(t);""")
+CREATE INDEX IF NOT EXISTS lt ON log(t);
+CREATE TABLE IF NOT EXISTS devices(mac TEXT PRIMARY KEY,ip TEXT,name TEXT,first REAL,last REAL);""")
 D.execute("DELETE FROM log WHERE t<?", (time.time() - 14 * 86400,))
 D.commit()
 FRESH = D.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
@@ -174,9 +176,8 @@ def check_pairs(conns):
                     new.append((c["proc"], lab, c["rip"]))
         D.commit()
     for proc, lab, ip in new:
-        alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), proc=proc, remote=lab, ip=ip))
-        subprocess.Popen(["osascript", "-e",
-                          f'display notification "{safe(lab)}" with title "NetGraph: новое соединение" subtitle "{safe(proc)}"'])
+        alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), kind="conn", proc=proc, remote=lab, ip=ip))
+        notify("NetGraph: новое соединение", proc, lab)
 
 
 def geo_loop():
@@ -272,6 +273,10 @@ def loop():
             dt = max(now - pt, 0.1)
             rates = {p: [max(0, (v[0] - pb[p][0]) / dt), max(0, (v[1] - pb[p][1]) / dt)]
                      for p, v in b.items() if p in pb}
+            for p, v in b.items():
+                if p in pb:
+                    sess["in"] += max(0, v[0] - pb[p][0])
+                    sess["out"] += max(0, v[1] - pb[p][1])
             pb, pt = b, now
             keys = {(c["proc"], c["rip"], c["rport"], c["lport"]): c for c in conns}
             if prev is not None:
@@ -281,7 +286,7 @@ def loop():
                     add_event("-", prev[k])
             prev = keys
             with lock:
-                state.update(conns=conns, listen=listen, rates=rates)
+                state.update(conns=conns, listen=listen, rates=rates, totals=dict(b))
             check_pairs(conns)
         except Exception as e:
             print("collect error:", e)
@@ -320,6 +325,27 @@ DEMO_PROCS = {
 }
 
 
+
+def demo_net(t, rnd):
+    now = time.time()
+    if not lan:
+        lan_state.update(ip="192.168.1.23", gw="192.168.1.1")
+        for i, (ip, mac, name, host) in enumerate([
+                ("192.168.1.1", "a4:2b:b0:11:22:33", "", "router.lan"), ("192.168.1.12", "3c:22:fb:aa:bb:01", "iPhone Ани", "anis-iphone.lan"),
+                ("192.168.1.15", "f0:18:98:cc:dd:02", "MacBook Pro", "macbook-pro.lan"), ("192.168.1.20", "9a:5e:77:12:34:56", "", ""),
+                ("192.168.1.31", "b8:27:eb:44:55:66", "Raspberry Pi", "raspberrypi.lan"), ("192.168.1.40", "7c:2e:bd:77:88:99", "Smart TV", "lg-webos.lan"),
+                ("192.168.1.57", "d2:4f:91:0a:0b:0c", "", "")]):
+            lan[mac] = dict(mac=mac, ip=ip, name=name, first=now - 86400 * (i + 1), last=now, flag_new=False)
+            if host:
+                dns[ip] = host
+        lan["d2:4f:91:0a:0b:0c"].update(first=now - 120, flag_new=True)
+        alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), kind="device", proc="192.168.1.57", remote="d2:4f:91:0a:0b:0c", ip="192.168.1.57", mac="d2:4f:91:0a:0b:0c"))
+    for i, d in enumerate(lan.values()):
+        d["last"] = now - (rnd.randint(0, 20) if i % 3 else rnd.randint(30, 400))
+    net_q["gw"].append(None if rnd.random() < .03 else 1.5 + abs(math.sin(t / 4)) * 3 + rnd.random() * 2)
+    net_q["inet"].append(None if rnd.random() < .05 else 18 + abs(math.sin(t / 7)) * 30 + rnd.random() * 10 + (60 if 20 < t % 60 < 24 else 0))
+
+
 def demo_loop():
     rnd = random.Random(7)
     ip_of = {h[0]: h[1] for h in DEMO_HOSTS}
@@ -339,6 +365,7 @@ def demo_loop():
     listen = [dict(proc="Code Helper", pid=7210, proto="TCP", port="5173"), dict(proc="Telegram", pid=3310, proto="UDP", port="49152"),
               dict(proc="Spotify", pid=6100, proto="TCP", port="57621")]
     active = list(pool_c)
+    totals = {}
     alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), proc="cloudd", remote="icloud.com", ip="17.57.144.20"))
     alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), proc="Code Helper", remote="githubusercontent.com", ip="185.199.108.133"))
     t = 0
@@ -357,17 +384,671 @@ def demo_loop():
         for name, (pid, _h) in DEMO_PROCS.items():
             base = {"Google Chrome": 9e5, "Spotify": 3e5, "Telegram": 6e4, "Claude": 2.5e5}.get(name, 1.2e4)
             rates[pid] = [abs(math.sin(t / 4 + pid)) * base * rnd.random(), abs(math.cos(t / 6 + pid)) * base * .15 * rnd.random()]
+        for pid, rr in rates.items():
+            tot = totals.setdefault(pid, [rnd.randint(1, 900) * 1e6, rnd.randint(1, 90) * 1e6])
+            tot[0] += rr[0] * 1.5
+            tot[1] += rr[1] * 1.5
+            sess["in"] += rr[0] * 1.5
+            sess["out"] += rr[1] * 1.5
+        demo_net(t, rnd)
         with lock:
-            state.update(conns=list(active), listen=listen, rates=rates)
+            state.update(conns=list(active), listen=listen, rates=rates, totals={k: list(v) for k, v in totals.items()})
         time.sleep(1.5)
+
+
+# ───────────────────── сеть: устройства, задержка, трафик, экспорт ─────────────────────
+CONFIG_FILE = os.path.join(HOME, "config.json")
+CONFIG = {"notify": True}
+try:
+    with open(CONFIG_FILE) as _f:
+        CONFIG.update(json.load(_f))
+except Exception:
+    pass
+sess = {"in": 0, "out": 0, "since": time.time()}
+net_q = {"gw": collections.deque(maxlen=90), "inet": collections.deque(maxlen=90)}
+lan = {}  # mac -> {mac, ip, name, first, last, flag_new}
+lan_state = {"scanning": False, "last_scan": 0, "ip": "", "gw": ""}
+LANL = threading.Lock()
+FRESH_DEV = D.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0
+
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(CONFIG, f)
+    except OSError:
+        pass
+
+
+def notify(title, sub, body=""):
+    """Системное уведомление macOS (можно отключить в настройках)."""
+    if CONFIG.get("notify") and sys.platform == "darwin":
+        subprocess.Popen(["osascript", "-e",
+                          f'display notification "{safe(body)}" with title "{safe(title)}" subtitle "{safe(sub)}"'])
+
+
+def tcp_rtt(host, port, timeout=1.5):
+    """Задержка до хоста по времени TCP-рукопожатия (RST тоже считается ответом). None — нет ответа."""
+    t = time.time()
+    try:
+        socket.create_connection((host, port), timeout).close()
+    except ConnectionRefusedError:
+        pass
+    except OSError:
+        return None
+    return (time.time() - t) * 1000
+
+
+def ping_loop():
+    gw, t0 = "", 0
+    while True:
+        if time.time() - t0 > 60:
+            gw, t0 = gateway_ip(), time.time()
+            lan_state["gw"] = gw
+        for key, host, port in (("gw", gw, 80), ("inet", "1.1.1.1", 443)):
+            if host:
+                net_q[key].append(tcp_rtt(host, port))
+        time.sleep(3)
+
+
+def local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+def parse_arp(text, ip_style=False):
+    """Разбор вывода `arp -an` (macOS/Linux) или `ip neigh`. macOS печатает MAC без ведущих нулей — нормализуем."""
+    rx = (r'^(\d+\.\d+\.\d+\.\d+)\s.*?lladdr\s+([0-9a-fA-F:]+)' if ip_style else r'\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-fA-F:]+)')
+    res = []
+    for m in re.finditer(rx, text, re.M):
+        ip, parts = m.group(1), m.group(2).split(":")
+        if len(parts) != 6:
+            continue
+        mac = ":".join(p.zfill(2) for p in parts).lower()
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if mac == "ff:ff:ff:ff:ff:ff" or mac.startswith("01:00:5e") or not a.is_private or ip.endswith(".255"):
+            continue
+        res.append((ip, mac))
+    return res
+
+
+def read_arp():
+    for cmd, st in ((["arp", "-an"], False), (["ip", "neigh"], True)):
+        try:
+            rows = parse_arp(subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout, st)
+            if rows:
+                return rows
+        except Exception:
+            continue
+    return []
+
+
+def lan_update():
+    now, new = time.time(), []
+    rows = read_arp()
+    lan_state["ip"] = lan_state["ip"] or local_ip()
+    with LANL, DBL:
+        for ip, mac in rows:
+            d = lan.get(mac)
+            if d is None:
+                r = D.execute("SELECT name, first FROM devices WHERE mac=?", (mac,)).fetchone()
+                d = lan[mac] = dict(mac=mac, name=r[0] if r else "", first=r[1] if r else now, flag_new=False)
+                if not r:
+                    D.execute("INSERT INTO devices VALUES(?,?,?,?,?)", (mac, ip, "", now, now))
+                    if not (FRESH_DEV and now - START < 600):
+                        d["flag_new"] = True
+                        new.append((ip, mac))
+            d.update(ip=ip, last=now)
+            D.execute("UPDATE devices SET ip=?, last=? WHERE mac=?", (ip, now, mac))
+        D.commit()
+    for ip, mac in new:
+        alerts.appendleft(dict(t=time.strftime("%H:%M:%S"), kind="device", proc=ip, remote=mac, ip=ip, mac=mac))
+        notify("NetGraph: новое устройство в сети", ip, mac)
+
+
+def lan_loop():
+    while True:
+        try:
+            lan_update()
+        except Exception as e:
+            print("lan error:", e)
+        time.sleep(15)
+
+
+def start_scan():
+    """Опрашивает подсеть /24 пингом, чтобы заполнить ARP-таблицу; возвращает False, если уже идёт."""
+    if lan_state["scanning"] or time.time() - lan_state["last_scan"] < 10:
+        return False
+    lan_state["scanning"] = True
+
+    def run():
+        try:
+            lip = local_ip()
+            if not lip:
+                return
+            lan_state["ip"] = lip
+            flag = ["-c", "1", "-t", "1"] if sys.platform == "darwin" else ["-c", "1", "-W", "1"]
+
+            def ping(h):
+                try:
+                    subprocess.run(["ping", *flag, str(h)], capture_output=True, timeout=4)
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(48) as ex:
+                list(ex.map(ping, [h for h in ipaddress.ip_network(lip + "/24", strict=False).hosts() if str(h) != lip]))
+            lan_update()
+        finally:
+            lan_state["scanning"] = False
+            lan_state["last_scan"] = time.time()
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+def lan_rows():
+    now, gw, lip, out = time.time(), lan_state["gw"], lan_state["ip"], []
+    with LANL:
+        items = [dict(d) for d in lan.values()]
+    for d in items:
+        out.append(dict(ip=d["ip"], mac=d["mac"], name=d.get("name", ""), host=host_of(d["ip"]), seen=now - d["last"],
+                        first=d["first"], role="router" if d["ip"] == gw else "",
+                        private=bool(int(d["mac"][:2], 16) & 2) and d["ip"] != gw,
+                        new=bool(d.get("flag_new")) and now - d["first"] < 900))
+    if lip and all(x["ip"] != lip for x in out):
+        out.append(dict(ip=lip, mac="", name="", host=socket.gethostname(), seen=0, first=START, role="me", private=False, new=False))
+    out.sort(key=lambda x: ipaddress.ip_address(x["ip"]))
+    return out
+
+
+def set_device_name(mac, name):
+    name = (name or "").strip()[:40]
+    with LANL:
+        if mac in lan:
+            lan[mac]["name"] = name
+    if not ARGS.demo:
+        with DBL:
+            D.execute("UPDATE devices SET name=? WHERE mac=?", (name, mac))
+            D.commit()
+
+
+def dismiss_alerts(req):
+    keep = [a for a in alerts if not (req.get("all") or (a.get("t") == req.get("t") and a.get("proc") == req.get("proc")
+                                                       and a.get("remote") == req.get("remote")))]
+    alerts.clear()
+    alerts.extend(keep)
+
+
+def export_data(what, fmt):
+    if what == "devices":
+        head = ["ip", "mac", "name", "hostname", "role", "private_mac", "first_seen"]
+        rows = [[x["ip"], x["mac"], x["name"], x["host"], x["role"], x["private"], time.strftime("%F %T", time.localtime(x["first"]))] for x in lan_rows()]
+    elif what == "log":
+        head = ["time", "event", "process", "remote", "port"]
+        with DBL:
+            rows = [[time.strftime("%F %T", time.localtime(r[0])), r[1], r[2], r[3], r[4]]
+                    for r in D.execute("SELECT t,s,proc,remote,port FROM log ORDER BY t DESC LIMIT 5000")]
+    else:
+        what = "connections"
+        head = ["process", "pid", "proto", "local_port", "remote_ip", "remote_host", "remote_port", "state", "kind"]
+        with lock:
+            rows = [[c["proc"], c["pid"], c["proto"], c["lport"], c["rip"], dns.get(c["rip"]) or "", c["rport"], c["state"], kind_of(c["rip"])]
+                    for c in state["conns"]]
+    name = f"netgraph-{what}-{time.strftime('%Y%m%d-%H%M%S')}"
+    if fmt == "json":
+        return json.dumps([dict(zip(head, r)) for r in rows], ensure_ascii=False, indent=1).encode(), "application/json", name + ".json"
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(head)
+    w.writerows(rows)
+    return ("﻿" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8", name + ".csv"
+
+
+# ───────────────────── управление Wi-Fi роутера (Realtek-админка) ─────────────────────
+# Страницы и формы НЕ зашиты в код: клиент читает их с самого роутера, меняет только поле
+# имени сети (SSID) или пароля (PSK), остальные поля отправляет как есть — так же, как браузер.
+ROUTER_LOCK = threading.Lock()
+# Эти страницы никогда не открываем при обходе: выход из админки, перезагрузка, сброс, прошивка и т.п.
+UNSAFE_PAGE = re.compile(r"log_?(out|off)|reboot|restart|reset|factory|restore|upgrade|firmware|commit|default|backup|save_?(cfg|conf)|shutdown", re.I)
+
+
+class _FormParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self.implicit = {"action": "", "method": "get", "fields": []}
+        self.cur, self.sel, self.opt, self.ta = self.implicit, None, None, None
+        self.script, self._js = [], False
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "script":
+            self._js = True
+        elif tag == "form":
+            self.cur = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "fields": []}
+            self.forms.append(self.cur)
+        elif tag == "input":
+            self.cur["fields"].append(dict(kind="input", type=a.get("type", "text").lower(), name=a.get("name", ""),
+                                           value=a.get("value", ""), checked="checked" in a, disabled="disabled" in a))
+        elif tag == "select":
+            self.sel = dict(kind="select", name=a.get("name", ""), disabled="disabled" in a, options=[])
+            self.cur["fields"].append(self.sel)
+        elif tag == "option" and self.sel is not None:
+            self.opt = {"value": a["value"] if "value" in a else None, "selected": "selected" in a, "text": ""}
+            self.sel["options"].append(self.opt)
+        elif tag == "textarea":
+            self.ta = dict(kind="textarea", name=a.get("name", ""), disabled="disabled" in a, value="")
+            self.cur["fields"].append(self.ta)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._js = False
+        elif tag == "form":
+            self.cur = self.implicit
+        elif tag == "select":
+            self.sel = self.opt = None
+        elif tag == "option":
+            self.opt = None
+        elif tag == "textarea":
+            self.ta = None
+
+    def handle_data(self, d):
+        if self._js:
+            self.script.append(d)
+        elif self.opt is not None:
+            self.opt["text"] += d
+        elif self.ta is not None:
+            self.ta["value"] += d
+
+
+_LIT = r"""(-?\d+|true|false|"[^"]*"|'[^']*')"""
+
+
+def _lit(x):
+    x = x.strip()
+    return (x == "true") if x in ("true", "false") else x[1:-1] if x[0] in "\"'" else int(x)
+
+
+def _apply_js(form, script):
+    """Realtek выставляет выбранные пункты скриптом (form.method.selectedIndex = 4), а не в HTML.
+    Без этого мы бы отправили первый пункт списка (например, шифрование «None») и сломали настройки."""
+    by = {}
+    for f in form["fields"]:
+        if f.get("name"):
+            by.setdefault(f["name"], []).append(f)
+    for m in re.finditer(r"\.(?:elements\[['\"](\w+)['\"]\]|(\w+))\.(selectedIndex|value|checked)\s*=\s*" + _LIT + r"\s*[;\n]", script):
+        name, prop, v = m.group(1) or m.group(2), m.group(3), _lit(m.group(4))
+        fl = by.get(name)
+        if not fl:
+            continue
+        f = fl[0]
+        if f["kind"] == "select":
+            opts = f["options"]
+            idx = v if prop == "selectedIndex" else next((i for i, o in enumerate(opts) if (o["value"] if o["value"] is not None else o["text"].strip()) == str(v)), None)
+            if isinstance(idx, int) and 0 <= idx < len(opts):
+                for i, o in enumerate(opts):
+                    o["selected"] = i == idx
+        elif f["kind"] == "input" and f["type"] in ("text", "hidden", "password") and prop == "value":
+            f["value"] = str(v)
+        elif f["kind"] == "input" and f["type"] == "checkbox" and prop == "checked":
+            f["checked"] = bool(v)
+    for m in re.finditer(r"\.(\w+)\[(\d+)\]\.checked\s*=\s*true", script):
+        grp = [f for f in by.get(m.group(1), []) if f["kind"] == "input" and f["type"] == "radio"]
+        i = int(m.group(2))
+        if i < len(grp):
+            for j, f in enumerate(grp):
+                f["checked"] = j == i
+
+
+def parse_forms(html):
+    p = _FormParser()
+    p.feed(html)
+    forms = list(p.forms)
+    if p.implicit["fields"]:
+        forms.append(p.implicit)
+    script = "\n".join(p.script)
+    for f in forms:
+        _apply_js(f, script)
+        for x in f["fields"]:
+            x["in_js"] = bool(x.get("name")) and re.search(r"\b" + re.escape(x["name"]) + r"\b", script) is not None
+    return forms
+
+
+def ambiguous_fields(form):
+    """Списки без выбранного пункта, которыми при этом управляет скрипт страницы: значение не определить."""
+    return [x["name"] for x in form["fields"] if x["kind"] == "select" and x["name"] and x["options"]
+            and not x["disabled"] and not any(o["selected"] for o in x["options"]) and x.get("in_js")]
+
+
+def build_payload(form, overrides):
+    """Собирает поля формы так же, как это сделал бы браузер; overrides подменяет значения по имени."""
+    out, used, btn = [], set(), None
+    for f in form["fields"]:
+        n = f.get("name", "")
+        if not n:
+            continue
+        k = f["kind"]
+        if k == "input":
+            t = f["type"]
+            if t in ("submit", "button", "image"):
+                if t != "image" and btn is None and re.search(r"apply|save|ok|submit|примен|сохран", f["value"], re.I):
+                    btn = (n, f["value"])
+                continue
+            if t in ("reset", "file"):
+                continue
+            if t in ("radio", "checkbox"):
+                if f["checked"]:  # отключённые, но отмеченные (напр. AES) сохраняем — это текущая настройка
+                    out.append((n, f["value"] or "on"))
+                continue
+            if f["disabled"]:
+                continue
+            v = f["value"]
+        elif k == "select":
+            if f["disabled"] or not f["options"]:
+                continue
+            o = next((o for o in f["options"] if o["selected"]), f["options"][0])
+            v = o["value"] if o["value"] is not None else o["text"].strip()
+        else:
+            if f["disabled"]:
+                continue
+            v = f["value"]
+        if n in overrides and n not in used:
+            v = overrides[n]
+            used.add(n)
+        out.append((n, v))
+    if btn:
+        out.append(btn)
+    return out
+
+
+def _field(form, pats, types=("text", "password"), skip=r"idx|type|num|enable"):
+    cands = [x for x in form["fields"] if x["kind"] == "input" and x["type"] in types and x["name"]
+             and not re.search(skip, x["name"], re.I)]
+    for rx in pats:
+        for x in cands:
+            if re.search(rx, x["name"], re.I):
+                return x
+    return None
+
+
+def _ssid_field(form):
+    return _field(form, (r"^ssid$", r"ssid"), types=("text",))
+
+
+def _psk_field(form):
+    return _field(form, (r"^pskvalue$", r"psk", r"pass(phrase|word)?", r"wpa.*key"))
+
+
+class RouterError(Exception):
+    pass
+
+
+class Router:
+    def __init__(self, hostport, user, pw):
+        self.host, _, port = hostport.partition(":")
+        self.base = f"http://{self.host}" + (f":{port}" if port else "")
+        self.user, self.pw = user, pw
+        self.log, self.pages, self.cur_band = [], {}, 0
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        tok = base64.b64encode(f"{user}:{pw}".encode()).decode()
+        self.hdr = {"Authorization": "Basic " + tok, "User-Agent": "Mozilla/5.0 (NetGraph)"}
+
+    def note(self, m):
+        self.log.append(m)
+
+    def fetch(self, path, data=None, referer=None, method="post"):
+        url = urllib.parse.urljoin(self.base + "/", path)
+        if urllib.parse.urlparse(url).hostname != self.host:
+            raise RouterError("запрос на чужой адрес отклонён")
+        h, body = dict(self.hdr), None
+        if referer:
+            h["Referer"] = referer
+        if data is not None:
+            enc = urllib.parse.urlencode(data)
+            if method == "get":
+                url += ("&" if "?" in url else "?") + enc
+            else:
+                body, h["Content-Type"] = enc.encode(), "application/x-www-form-urlencoded"
+        try:
+            r = self.op.open(urllib.request.Request(url, data=body, headers=h), timeout=8)
+            raw, final = r.read(), r.geturl()
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise RouterError("Неверный логин или пароль администратора")
+            raise RouterError(f"HTTP {e.code} для {urllib.parse.urlparse(url).path}")
+        if urllib.parse.urlparse(final).hostname != self.host:
+            raise RouterError("роутер перенаправил на чужой адрес")
+        try:
+            return final, raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return final, raw.decode("latin-1")
+
+    @staticmethod
+    def _login_form(html):
+        return next((f for f in parse_forms(html) if any(x["kind"] == "input" and x["type"] == "password" for x in f["fields"])), None)
+
+    def connect(self):
+        try:
+            url, html = self.fetch("/")
+        except urllib.error.URLError as e:
+            raise RouterError(f"Роутер недоступен: {e.reason}")
+        except OSError as e:
+            raise RouterError(f"Роутер недоступен: {e}")
+        lf = self._login_form(html)
+        if lf:
+            self.note("вход: найдена форма входа, отправляю логин и пароль")
+            ov = {}
+            for x in lf["fields"]:
+                if x["kind"] == "input" and x["type"] == "password" and "p" not in ov:
+                    ov[x["name"]] = self.pw
+                    ov["p"] = 1
+                elif x["kind"] == "input" and x["type"] == "text" and "u" not in ov and x["name"]:
+                    ov[x["name"]] = self.user
+                    ov["u"] = 1
+            ov = {k: v for k, v in ov.items() if k not in ("p", "u")}
+            self.fetch(urllib.parse.urljoin(url, lf["action"] or url), build_payload(lf, ov), referer=url)
+            url, html = self.fetch("/")
+            if self._login_form(html):
+                raise RouterError("Не удалось войти: проверьте логин и пароль (или у роутера нестандартная форма входа)")
+        else:
+            self.note("вход: HTTP Basic")
+        self.find_pages(url)
+
+    def find_pages(self, root):
+        seen, queue, found = set(), [root], {}
+        rx = re.compile(r"[\w./\-]+\.(?:htm|html|asp)(?:\?[\w=&.\-]*)?", re.I)
+        while queue and len(seen) < 30:
+            p = queue.pop(0)
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                url, html = self.fetch(p)
+            except Exception:
+                continue
+            for m in rx.findall(html):
+                u = urllib.parse.urljoin(url, m)
+                if urllib.parse.urlparse(u).hostname != self.host:
+                    continue
+                low = urllib.parse.urlparse(u).path.lower()
+                if UNSAFE_PAGE.search(low):
+                    continue
+                if "wlbasic" in low:
+                    found.setdefault("basic", u)
+                if re.search(r"wl(wpa|security|encrypt)", low):
+                    found.setdefault("sec", u)
+                if u not in seen:
+                    queue.append(u)
+            if "basic" in found and "sec" in found:
+                break
+        for kind, cands, finder in (("basic", ("/admin/wlbasic.htm", "/wlbasic.htm"), _ssid_field),
+                                    ("sec", ("/admin/wlwpa.htm", "/wlwpa.htm"), _psk_field)):
+            if kind in found:
+                continue
+            for c in cands:
+                try:
+                    u, h = self.fetch(c)
+                    if any(finder(f) for f in parse_forms(h)):
+                        found[kind] = u
+                        break
+                except Exception:
+                    pass
+        self.pages = found
+        self.note("страницы: " + ", ".join(f"{k}={urllib.parse.urlparse(v).path}" for k, v in found.items()) if found else "страницы Wi-Fi не найдены")
+        if len(found) < 2:
+            raise RouterError("Не нашёл страницы настроек Wi-Fi (" + ("нужны basic и security" if found else "ни одной") + "). Журнал ниже — пришлите его разработчику.")
+
+    def select_band(self, idx):
+        if idx == self.cur_band:
+            return True
+        try:
+            page = urllib.parse.urlparse(self.pages["sec"]).path
+            self.fetch("/boaform/admin/formWlanRedirect", [("redirect-url", page), ("wlan_idx", str(idx))], referer=self.pages["sec"])
+            self.cur_band = idx
+            return True
+        except Exception as e:
+            self.note(f"переключение диапазона {idx} не удалось: {e}")
+            return False
+
+    def _read(self, kind, finder, idx):
+        url, html = self.fetch(self.pages[kind])
+        forms = parse_forms(html)
+        band_ids = {x["value"] for f in forms for x in f["fields"] if x.get("name", "").lower() == "wlan_idx"}
+        confirmed = bool(band_ids)
+        if band_ids and str(idx) not in band_ids:
+            raise RouterError(f"роутер показал другой диапазон ({','.join(band_ids)})")
+        for f in forms:
+            x = finder(f)
+            if x:
+                return url, f, x, confirmed
+        raise RouterError(f"на странице {urllib.parse.urlparse(url).path} нет нужного поля")
+
+    def read_band(self, idx):
+        res = {"idx": idx, "label": "2.4 ГГц" if idx == 0 else "5 ГГц", "ok": False}
+        if not self.select_band(idx):
+            res["error"] = "диапазон не переключается"
+            return res
+        try:
+            _u, _f, x, c1 = self._read("basic", _ssid_field, idx)
+            res["ssid"] = x["value"]
+            _u, _f, y, c2 = self._read("sec", _psk_field, idx)
+            res["psk"] = y["value"]
+            res["confirmed"] = c1 and c2
+            res["ok"] = True
+        except RouterError as e:
+            res["error"] = str(e)
+        return res
+
+    def update(self, kind, finder, value, idx):
+        url, f, x, _c = self._read(kind, finder, idx)
+        amb = ambiguous_fields(f)
+        if amb:
+            raise RouterError("Не могу однозначно определить текущие значения полей: " + ", ".join(amb) +
+                              ". Чтобы случайно не поменять лишнее, запись отменена — пришлите технический журнал.")
+        payload = build_payload(f, {x["name"]: value})
+        try:
+            bk = os.path.join(HOME, time.strftime(f"router-backup-%Y%m%d-%H%M%S-{kind}{idx}.json"))
+            with open(bk, "w") as fh:
+                json.dump(dict(url=url, band=idx, form=f["action"], fields=build_payload(f, {})), fh, ensure_ascii=False, indent=1)
+            os.chmod(bk, 0o600)
+            self.note("резервная копия формы: " + bk)
+        except OSError as e:
+            raise RouterError(f"Не удалось сохранить резервную копию ({e}) — запись отменена")
+        action = urllib.parse.urljoin(url, f["action"] or url)
+        self.note(f"{kind}: отправка формы {urllib.parse.urlparse(action).path}, полей: {len(payload)}")
+        try:
+            self.fetch(action, payload, referer=url, method=f["method"])
+        except RouterError as e:
+            self.note(f"ответ роутера: {e}")
+        except OSError as e:
+            self.note(f"связь оборвалась после отправки (роутер мог перезапустить Wi-Fi): {e}")
+        for _ in range(5):  # проверяем, что значение действительно сохранилось
+            time.sleep(2.5)
+            try:
+                _u, _f, y, _c2 = self._read(kind, finder, idx)
+                return y["value"] == value
+            except Exception:
+                continue
+        return None
+
+
+def _router_args(req):
+    host = str(req.get("host", "")).strip()
+    h, _, port = host.partition(":")
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        raise RouterError("Укажите IP-адрес роутера, например 192.168.1.1")
+    if not (ip.is_private or ip.is_loopback):
+        raise RouterError("Разрешены только адреса локальной сети")
+    if port and not port.isdigit():
+        raise RouterError("Неверный порт")
+    return host, str(req.get("user", "")), str(req.get("pass", ""))
+
+
+def router_op(req, apply):
+    if not ROUTER_LOCK.acquire(blocking=False):
+        return dict(ok=False, error="Операция с роутером уже выполняется", log=[])
+    r = None
+    try:
+        host, user, pw = _router_args(req)
+        r = Router(host, user, pw)
+        r.connect()
+        if not apply:
+            bands = [r.read_band(i) for i in (0, 1)]
+            r.select_band(0)
+            r.note("диапазонов найдено: %d" % sum(b["ok"] for b in bands))
+            return dict(ok=any(b["ok"] for b in bands), bands=bands, log=r.log,
+                        error=None if any(b["ok"] for b in bands) else "Не удалось прочитать настройки Wi-Fi")
+        ssid, psk = req.get("ssid") or "", req.get("psk") or ""
+        if not ssid and not psk:
+            raise RouterError("Нечего менять")
+        if ssid and not 1 <= len(ssid.encode()) <= 32:
+            raise RouterError("Имя сети: от 1 до 32 байт")
+        if psk and not (8 <= len(psk) <= 63 and all(32 <= ord(c) < 127 for c in psk) or re.fullmatch(r"[0-9a-fA-F]{64}", psk)):
+            raise RouterError("Пароль: 8–63 символа (латиница, цифры, знаки)")
+        bands = [int(b) for b in req.get("bands", [0]) if int(b) in (0, 1)]
+        results = []
+        for idx in bands:
+            res = {"idx": idx}
+            if not r.select_band(idx):
+                res["error"] = "диапазон не переключается"
+            else:
+                try:
+                    if ssid:
+                        res["ssid"] = r.update("basic", _ssid_field, ssid, idx)
+                        time.sleep(2)
+                    if psk:
+                        res["psk"] = r.update("sec", _psk_field, psk, idx)
+                except RouterError as e:
+                    res["error"] = str(e)
+            results.append(res)
+        r.select_band(0)
+        return dict(ok=all("error" not in x and x.get("ssid", True) is not False and x.get("psk", True) is not False for x in results),
+                    results=results, log=r.log)
+    except RouterError as e:
+        return dict(ok=False, error=str(e), log=r.log if r else [])
+    except Exception as e:
+        return dict(ok=False, error="Ошибка: %s" % e, log=r.log if r else [])
+    finally:
+        ROUTER_LOCK.release()
 
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, body, ctype, code=200):
+    def _send(self, body, ctype, code=200, extra=()):
         self.send_response(code)
+        for k, v in extra:
+            self.send_header(k, v)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -394,6 +1075,41 @@ class H(BaseHTTPRequestHandler):
             if not ARGS.demo:
                 set_geo(on)
             return self._send(json.dumps(dict(ok=True, on=ARGS.geo)).encode(), "application/json")
+        if self.path.startswith("/router/"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(b"bad request", "text/plain", 400)
+            if ARGS.demo:
+                return self._send(json.dumps(dict(ok=False, error="В демо-режиме роутер не опрашивается", log=[])).encode(), "application/json")
+            return self._send(json.dumps(router_op(req, self.path.startswith("/router/apply"))).encode(), "application/json")
+        if self.path in ("/lan/scan", "/lan/name", "/alerts/dismiss", "/config"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(min(n, 5000)) or b"{}")
+            except Exception:
+                return self._send(b"bad request", "text/plain", 400)
+            if self.path == "/lan/scan":
+                if ARGS.demo:
+                    lan_state["scanning"] = True
+                    threading.Timer(2.5, lambda: lan_state.update(scanning=False)).start()
+                    ok = True
+                else:
+                    ok = start_scan()
+                res = dict(ok=ok)
+            elif self.path == "/lan/name":
+                set_device_name(str(req.get("mac", "")), str(req.get("name", "")))
+                res = dict(ok=True)
+            elif self.path == "/alerts/dismiss":
+                dismiss_alerts(req)
+                res = dict(ok=True)
+            else:
+                if "notify" in req:
+                    CONFIG["notify"] = bool(req["notify"])
+                    save_config()
+                res = dict(ok=True, notify=CONFIG["notify"])
+            return self._send(json.dumps(res).encode(), "application/json")
         self._send(b"not found", "text/plain", 404)
 
     def do_GET(self):
@@ -418,8 +1134,14 @@ class H(BaseHTTPRequestHandler):
                                        events=list(events)[:120], alerts=list(alerts)[:15],
                                        geo={c["rip"]: geo.get(c["rip"], {}) for c in conns}, me=me_geo,
                                        geo_on=ARGS.geo, geo_pending=geo_state["pending"], geo_err=geo_state["err"],
-                                       demo=ARGS.demo)).encode()
+                                       demo=ARGS.demo, totals=state.get("totals", {}), lan=lan_rows(), lan_scanning=lan_state["scanning"],
+                                       quality={k: list(v) for k, v in net_q.items()}, notify=CONFIG["notify"],
+                                       session=dict(sess, now=time.time()))).encode()
             self._send(body, "application/json")
+        elif path == "/export":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            body, ctype, fname = export_data((q.get("what") or [""])[0], (q.get("fmt") or ["csv"])[0])
+            self._send(body, ctype, extra=[("Content-Disposition", f'attachment; filename="{fname}"')])
         elif path == "/gateway":
             self._send(json.dumps(dict(ip="192.168.1.1" if ARGS.demo else gateway_ip())).encode(), "application/json")
         elif path == "/world.json":
@@ -526,11 +1248,11 @@ kbd{font:600 10px/1 var(--mono);color:var(--tx3);border:1px solid var(--line2);b
 
 /* боковая панель */
 aside{width:360px;flex:none;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
-.tabs{display:flex;padding:10px 10px 0;gap:2px;border-bottom:1px solid var(--line)}
-.tab{flex:1;background:none;border:0;color:var(--tx3);font:inherit;font-size:12.5px;font-weight:560;padding:9px 0 12px;cursor:pointer;position:relative;white-space:nowrap;transition:color .15s}
+.tabs{display:flex;padding:10px 6px 0;gap:0;border-bottom:1px solid var(--line)}
+.tab{flex:1;background:none;border:0;color:var(--tx3);font:inherit;font-size:11.5px;font-weight:560;padding:9px 0 12px;cursor:pointer;position:relative;white-space:nowrap;transition:color .15s}
 .tab:hover{color:var(--tx2)}.tab.on{color:var(--tx)}
 .tab.on::after{content:"";position:absolute;left:10px;right:10px;bottom:-1px;height:2px;border-radius:2px;background:var(--acc);box-shadow:0 0 12px var(--acc)}
-.badge{display:inline-block;min-width:16px;padding:1px 5px;margin-left:4px;border-radius:9px;background:var(--bad);color:#fff;font-size:10px;font-weight:700;line-height:14px;text-align:center}
+.badge{display:inline-block;min-width:16px;padding:1px 5px;margin-left:3px;border-radius:9px;background:var(--bad);color:#fff;font-size:10px;font-weight:700;line-height:14px;text-align:center}
 .pane{display:none;flex:1;min-height:0;overflow:auto;padding:16px 14px}
 .pane.on{display:block}
 .pane::-webkit-scrollbar{width:8px}.pane::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:8px;border:2px solid var(--panel)}
@@ -630,7 +1352,27 @@ svg.alllbl .lbl.r{opacity:.92}
 .router{margin:4px 16px 0;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--tx2);font-size:12.5px}
 .router b{color:var(--tx)}
 .router p{margin:8px 0 0}
-.router .btn{display:inline-block;margin-top:10px;text-decoration:none;font-size:12.5px;padding:8px 14px}
+.router .btn{display:inline-block;text-decoration:none;font-size:12.5px;padding:8px 14px}
+.router label{display:block;font-size:11px;color:var(--tx3);margin:0 0 4px}
+.in{width:100%;background:rgba(255,255,255,.05);border:1px solid var(--line2);border-radius:8px;color:var(--tx);font:inherit;padding:8px 10px;outline:0;transition:.15s}
+.in:focus{border-color:rgba(167,139,250,.6);box-shadow:0 0 0 3px rgba(167,139,250,.15)}
+.rt-f{margin-top:10px}.rt-two{display:grid;grid-template-columns:1fr 1.4fr;gap:8px;margin-top:10px}
+.rt-msg{margin-top:10px;padding:9px 11px;border-radius:9px;font-size:12.5px;background:rgba(255,255,255,.05)}
+.rt-msg.ok{background:rgba(91,227,154,.1);color:var(--ok)}.rt-msg.err{background:rgba(255,107,129,.1);color:var(--bad)}.rt-msg.warn{background:rgba(245,185,74,.1);color:var(--warn)}
+.band{display:flex;gap:9px;align-items:flex-start;padding:7px 0;color:var(--tx);font-size:12.5px;cursor:pointer}
+.band input{margin-top:3px;accent-color:#a78bfa}
+.band .dim{display:block;font-size:11.5px}
+.band a{color:var(--acc);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+#rt-logw{margin-top:10px;font-size:11.5px;color:var(--tx3)}
+#rt-log{white-space:pre-wrap;word-break:break-all;font:11px/1.5 var(--mono);margin:6px 0 0;max-height:160px;overflow:auto;user-select:text}
+.qrow{display:flex;align-items:center;gap:12px;padding:8px 2px;border-bottom:1px solid var(--line)}
+.qrow:last-of-type{border:0}
+.qs{width:150px;height:30px;flex:none;overflow:visible}
+.qrow b.bad{color:var(--bad)}
+.al-a{margin-top:8px}
+.alert.dev{border-color:rgba(245,185,74,.3);border-left-color:var(--warn);background:rgba(245,185,74,.07)}
+.kbrow{display:flex;justify-content:space-between;align-items:center;padding:6px 0;color:var(--tx2)}
+.kbrow kbd{margin-left:4px;font-size:11px;padding:3px 7px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 @media (max-width:860px){#app{flex-direction:column}aside{width:auto;height:42%;border-left:0;border-top:1px solid var(--line)}#stats{top:112px}.stat.sp{display:none}}
 </style></head>
@@ -664,6 +1406,7 @@ svg.alllbl .lbl.r{opacity:.92}
   <div class="stat"><b id="s-h">–</b><span>хостов</span></div>
   <div class="stat d"><b id="s-d">–</b><span>↓ приём</span></div>
   <div class="stat u"><b id="s-u">–</b><span>↑ отдача</span></div>
+  <div class="stat"><b id="s-ping">–</b><span>пинг</span></div>
   <div class="stat sp"><svg id="spark" viewBox="0 0 150 34"><defs><linearGradient id="spg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3ee0cb" stop-opacity=".28"/><stop offset="1" stop-color="#3ee0cb" stop-opacity="0"/></linearGradient></defs><path class="sp-a"/><path class="sp-d"/><path class="sp-u"/></svg></div>
  </div>
 
@@ -693,12 +1436,39 @@ svg.alllbl .lbl.r{opacity:.92}
   <div class="st-r"><span>Показывать localhost</span><label class="sw"><input type="checkbox" id="c-loc"><i></i></label></div>
   <div class="st-r"><span>Подписи всех узлов</span><label class="sw"><input type="checkbox" id="c-lbl"><i></i></label></div>
   <div class="st-r"><span>Обновление данных</span><div class="seg mini"><button id="iv-1000">1 с</button><button id="iv-2000">2 с</button><button id="iv-5000">5 с</button></div></div>
+  <div class="st-r"><span>Устройства сети на графе</span><label class="sw"><input type="checkbox" id="c-devs"><i></i></label></div>
+  <div class="st-s">Уведомления и данные</div>
+  <div class="st-r"><span>Системные уведомления</span><label class="sw"><input type="checkbox" id="c-notify" checked><i></i></label></div>
+  <div class="st-r"><span>Экспорт (CSV)</span><div class="seg mini"><button id="ex-conns">Соединения</button><button id="ex-dev">Устройства</button><button id="ex-log">Лог</button></div></div>
+  <div class="st-r"><span>Горячие клавиши</span><button class="btn ghost sm" id="st-help">Показать (?)</button></div>
   <div class="st-s">Wi-Fi роутера</div>
-  <div class="router"><b>GPON-терминал MA670V3</b> (Photonspeak / Dragon Path GP700)<br>Адрес: <span class="mono" id="rt-ip">…</span>
-   <p>Менять имя и пароль Wi-Fi из NetGraph пока нельзя: у этой модели нет документированного интерфейса, а запись вслепую может оставить вас без Wi-Fi и интернета. Откройте админку и поменяйте их в разделе WLAN / Wi-Fi.</p>
-   <a class="btn" id="rt-open" target="_blank" rel="noopener" hidden>Открыть админку роутера</a></div>
+  <div class="router"><b>GPON-терминал MA670V3</b> (Photonspeak / Dragon Path GP700)
+   <div class="rt-f"><label>Адрес роутера</label><input class="in mono" id="rt-host" value="192.168.1.1" spellcheck="false"></div>
+   <div class="rt-two"><div><label>Логин</label><input class="in" id="rt-user" value="admin" autocomplete="off" spellcheck="false"></div>
+   <div><label>Пароль админки</label><input class="in" id="rt-pass" type="password" autocomplete="off" placeholder="пароль админки"></div></div>
+   <button class="btn" id="rt-connect" style="margin-top:10px">Подключиться</button>
+   <a class="btn ghost" id="rt-open" target="_blank" rel="noopener" hidden>Открыть админку</a>
+   <div class="rt-msg" id="rt-msg" hidden></div>
+   <div id="rt-edit" hidden>
+    <div class="rt-f"><label>Диапазоны</label><div id="rt-bands"></div></div>
+    <div class="rt-f"><label>Новое имя сети (SSID)</label><input class="in" id="rt-ssid" maxlength="32" spellcheck="false"></div>
+    <div class="rt-f"><label>Новый пароль Wi-Fi <span class="dim">(пусто — не менять)</span></label><input class="in" id="rt-psk" maxlength="63" autocomplete="off" spellcheck="false" placeholder="8–63 символа"></div>
+    <button class="btn" id="rt-apply" style="margin-top:10px">Применить</button>
+   </div>
+   <details id="rt-logw" hidden><summary>Технический журнал</summary><pre id="rt-log"></pre></details>
+  </div>
  </div>
  <div id="mapcard" class="glass card" hidden></div>
+ <div id="help" class="glass card" hidden style="text-align:left;width:min(360px,calc(100% - 30px));z-index:9">
+  <div class="rw" style="margin-bottom:8px"><b style="font-size:15px">Горячие клавиши</b><span class="dim">Esc — закрыть</span></div>
+  <div class="kbrow"><span>Поиск</span><span><kbd>/</kbd></span></div>
+  <div class="kbrow"><span>Граф / Карта</span><span><kbd>G</kbd><kbd>M</kbd></span></div>
+  <div class="kbrow"><span>Вкладка «Сеть»</span><span><kbd>N</kbd></span></div>
+  <div class="kbrow"><span>Пауза</span><span><kbd>P</kbd></span></div>
+  <div class="kbrow"><span>Вписать в экран</span><span><kbd>F</kbd></span></div>
+  <div class="kbrow"><span>Настройки</span><span><kbd>S</kbd></span></div>
+  <div class="kbrow"><span>Эта подсказка</span><span><kbd>?</kbd></span></div>
+ </div>
  <div id="splash" class="glass card" hidden></div>
  <div id="tip"></div>
 </main>
@@ -707,12 +1477,14 @@ svg.alllbl .lbl.r{opacity:.92}
  <nav class="tabs">
   <button class="tab on" data-t="node">Узел</button>
   <button class="tab" data-t="geo">Гео</button>
+  <button class="tab" data-t="net">Сеть</button>
   <button class="tab" data-t="ev">Лог</button>
   <button class="tab" data-t="al">Тревоги<span class="badge" id="b-al" hidden>0</span></button>
   <button class="tab" data-t="hist">История</button>
  </nav>
  <section class="pane on" id="pane-node"></section>
  <section class="pane" id="pane-geo"></section>
+ <section class="pane" id="pane-net"></section>
  <section class="pane ev" id="pane-ev"></section>
  <section class="pane" id="pane-al"></section>
  <section class="pane" id="pane-hist"></section>
@@ -753,7 +1525,7 @@ const empty=(ic,t,s)=>`<div class="empty"><div class="ic">${ICON[ic]}</div><div 
 let data=null,view='g',tab='node',paused=false,sel=null,hov=null,firstFit=false;
 const flt={grp:true,loc:false};
 const tp=[];
-const cfg=Object.assign({mode:'globe',rotate:true,labels:false,interval:2000},(()=>{try{return JSON.parse(localStorage.getItem('ng-cfg')||'{}')}catch(e){return{}}})());
+const cfg=Object.assign({mode:'globe',rotate:true,labels:false,devs:false,interval:2000},(()=>{try{return JSON.parse(localStorage.getItem('ng-cfg')||'{}')}catch(e){return{}}})());
 const saveCfg=()=>{try{localStorage.setItem('ng-cfg',JSON.stringify(cfg))}catch(e){}};
 function showMapSvg(){$('m').style.display=view==='m'&&cfg.mode==='flat'?'':'none';$('gl').style.display=view==='m'&&cfg.mode==='globe'?'':'none'}
 
@@ -813,11 +1585,17 @@ function build(d){
   p.deg++;r.deg++;
   link('me','p:'+c.proc,'me');link('p:'+c.proc,'r:'+rl,c.kind);
  });
+ if(cfg.devs&&d.lan)d.lan.forEach(v=>{
+  if(v.role==='me')return;
+  const nmv=v.name||v.host||(v.role==='router'?'Роутер':v.ip);
+  if(q&&!(nmv+v.ip+v.mac).toLowerCase().includes(q))return;
+  const id='d:'+(v.mac||v.ip);node(id,{label:nmv,type:'lan',dev:v,ips:new Set([v.ip]),procs:new Set()}).deg++;link('me',id,'lan')});
  d.listen.forEach(x=>{const p=nm.get('p:'+x.proc);if(p)p.listen.add(x.port+'/'+x.proto)});
  for(const[name,s]of Object.entries(pids)){
   const p=nm.get('p:'+name);let i=0,o=0;
   s.forEach(pid=>{const r=d.rates[pid];if(r){i+=r[0];o+=r[1]}});
   p.rin=i;p.rout=o;p.rate=i+o;p.pids=s;
+  let ti=0,to=0;s.forEach(pid=>{const t=d.totals&&d.totals[pid];if(t){ti+=t[0];to+=t[1]}});p.tin=ti;p.tout=to;
  }
  lm.forEach(l=>{const p=nm.get(l.source.startsWith('p:')?l.source:l.target);l.hot=p.rate>200});
  const old=new Map(nodes.map(n=>[n.id,n]));
@@ -841,6 +1619,7 @@ const drag=d3.drag()
 function tipHtml(n){
  let h=`<b>${esc(n.label)}</b><div class="dim">${n.type==='proc'?'процесс':n.type==='me'?'этот компьютер':n.type==='wan'?'интернет':n.type==='lan'?'локальная сеть':'localhost'}</div>`;
  if(n.type==='proc')h+=`<div>↓ ${fmt(n.rin)} &nbsp; ↑ ${fmt(n.rout)}</div><div class="dim">${n.deg} соед.</div>`;
+ else if(n.dev){h+=`<div class="dim mono">${esc(n.dev.ip)}</div><div class="dim mono">${esc(n.dev.mac)}</div>`}
  else if(n.type!=='me'){h+=`<div class="dim">${n.procs.size} проц. · ${n.deg} соед.</div>`;
   const g=data&&[...n.ips].map(ip=>data.geo[ip]).find(g=>g&&g.country);if(g)h+=`<div>${flag(g.countryCode)} ${esc(g.city||g.country)}</div>`}
  return h}
@@ -887,8 +1666,14 @@ function fit(animate=true){
 }
 
 /* ── панель «Узел» ── */
+const COMMON=new Set([20,21,22,25,53,80,110,123,143,443,465,587,853,993,995,1900,3478,5222,5228,5353,8080,8443]);
+const odd=(port,proto)=>proto==='TCP'&&+port>0&&+port<49152&&!COMMON.has(+port)?'<span class="tag warn" title="Нестандартный порт">порт</span>':'';
+const fmtB=b=>b<1024?Math.round(b)+' Б':b<1048576?(b/1024).toFixed(1)+' КБ':b<1073741824?(b/1048576).toFixed(1)+' МБ':(b/1073741824).toFixed(2)+' ГБ';
+const ago=s=>s<90?'только что':s<5400?Math.round(s/60)+' мин назад':s<172800?Math.round(s/3600)+' ч назад':Math.round(s/86400)+' дн назад';
+const post=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()).catch(()=>({}));
+function devInfo(v){return `<div class="geo"><div class="big">${esc(v.name||v.host||(v.role==='router'?'Роутер':'Неизвестное устройство'))}</div><div class="mono dim">${esc(v.ip)}${v.mac?' · '+esc(v.mac):''}</div><div class="dim">${v.role==='router'?'Роутер (шлюз по умолчанию)':'Виден '+ago(v.seen)}</div>${v.private?'<div class="dim" style="margin-top:6px">Приватный (случайный) MAC-адрес</div>':''}</div>`}
 const conRow=(h,port,proto,st)=>{const cls=st==='ESTABLISHED'?'ok':/WAIT|CLOSE|SYN|FIN/.test(st)?'warn':'';
- return `<div class="conn"><span class="mono">${esc(h)}:${esc(port)}</span><span class="tag">${esc(proto)}</span><span class="tag ${cls}">${esc(st)}</span></div>`};
+ return `<div class="conn"><span class="mono">${esc(h)}:${esc(port)}</span><span class="tag">${esc(proto)}</span>${odd(port,proto)}<span class="tag ${cls}">${esc(st)}</span></div>`};
 function topProcs(){
  const ps=nodes.filter(x=>x.type==='proc').sort((a,b)=>b.rate-a.rate||b.deg-a.deg).slice(0,10),mx=Math.max(1,...ps.map(p=>p.rate));
  return '<div class="sec-t">Топ процессов</div>'+(ps.length?ps.map(p=>`<div class="row click" data-id="${esc(p.id)}"><i class="dotc" style="color:${COL.proc};background:${COL.proc}"></i><div class="grow"><div class="rw"><span class="nm">${esc(p.label)}</span><span class="dim">${p.rate>1?fmt(p.rate):p.deg+' соед.'}</span></div><div class="bar"><i style="width:${Math.max(3,p.rate/mx*100)}%;background:${COL.proc}"></i></div></div></div>`).join(''):empty('node','Нет соединений','Попробуйте убрать фильтр или запустить с sudo'))}
@@ -900,9 +1685,11 @@ function details(){
   const hd=sub=>`<div class="hd"><i class="dotc big" style="color:${c};background:${c}"></i><div><div class="ttl">${esc(n.label)}</div><div class="dim">${sub}</div></div></div>`;
   if(n.type==='proc'){
    h+=hd(`${n.pids?[...n.pids].map(p=>'PID '+p).slice(0,3).join(', '):''}${n.pids&&n.pids.size>3?' …':''}`);
-   h+=`<div class="rates"><div class="rate d"><span>↓ приём</span><b>${fmt(n.rin||0)}</b></div><div class="rate u"><span>↑ отдача</span><b>${fmt(n.rout||0)}</b></div></div>`;
+   h+=`<div class="rates"><div class="rate d"><span>↓ приём</span><b>${fmt(n.rin||0)}</b></div><div class="rate u"><span>↑ отдача</span><b>${fmt(n.rout||0)}</b></div></div>`+(n.tin||n.tout?`<div class="dim" style="font-size:12px;margin:0 2px">с запуска процесса: ↓ ${fmtB(n.tin)} · ↑ ${fmtB(n.tout)}</div>`:'');
    if(n.listen&&n.listen.size)h+=`<div class="sec-t">Слушает</div><div class="chips">${[...n.listen].slice(0,14).map(x=>`<span class="pill">${esc(x)}</span>`).join('')}</div>`;
    h+=`<div class="sec-t">Соединения · ${n.info.size}</div>`+[...n.info.values()].slice(0,80).map(i=>conRow(i.host,i.port,i.proto,i.state)).join('');
+  }else if(n.dev){
+   h+=hd(n.dev.role==='router'?'роутер':'устройство в сети')+devInfo(n.dev);
   }else{
    h+=hd(n.type==='wan'?'интернет':n.type==='lan'?'локальная сеть':'localhost');
    const g=data&&[...n.ips].map(ip=>data.geo[ip]).find(g=>g&&g.country);
@@ -1116,12 +1903,13 @@ const zbtn=f=>()=>{if(view==='g')svg.transition().duration(250).call(zoom.scaleB
 $('zin').onclick=zbtn(1.5);$('zout').onclick=zbtn(1/1.5);
 $('zfit').onclick=()=>{if(view==='g')fit();else if(cfg.mode==='flat')msvg.transition().duration(500).call(mZoom.transform,d3.zoomIdentity);else{gk=1;if(glMe)rot=homeRot(glMe);frameGlobe()}};
 document.addEventListener('keydown',e=>{
- if(e.target.tagName==='INPUT'){if(e.key==='Escape'){e.target.value='';e.target.blur();refresh()}return}
+ if(e.target.tagName==='INPUT'&&e.target.type!=='checkbox'){if(e.key==='Escape'){e.target.value='';e.target.blur();refresh()}return}
  if(e.metaKey||e.ctrlKey||e.altKey)return;
  if(e.key==='/'){e.preventDefault();$('q').focus()}
  else if(e.key==='g')setView('g');else if(e.key==='m')setView('m');
  else if(e.key==='p')$('pause').click();else if(e.key==='f')$('zfit').click();
- else if(e.key==='s')toggleSettings();else if(e.key==='Escape'){select(null);toggleSettings(false)}
+ else if(e.key==='s')toggleSettings();else if(e.key==='n')setTab('net');else if(e.key==='?')$('help').hidden=!$('help').hidden;
+ else if(e.key==='Escape'){select(null);toggleSettings(false);$('help').hidden=true}
 });
 new ResizeObserver(()=>{if(view!=='m')return;if(cfg.mode==='flat'){if(mapLayout()&&data)drawMap(data)}else frameGlobe()}).observe(stage);
 
@@ -1140,6 +1928,9 @@ function hud(d){
  $('s-c').textContent=d.conns.length;$('s-p').textContent=new Set(d.conns.map(c=>c.proc)).size;
  $('s-h').textContent=new Set(d.conns.filter(c=>c.kind!=='local').map(c=>c.rip)).size;
  $('s-d').textContent=fmt(i);$('s-u').textContent=fmt(o);spark();
+ const iq=(d.quality&&d.quality.inet)||[],lq=iq.length?iq[iq.length-1]:undefined,pe=$('s-ping');
+ if(lq===undefined){pe.textContent='–';pe.style.color=''}else if(lq===null){pe.textContent='нет';pe.style.color='var(--bad)'}
+ else{pe.textContent=Math.round(lq)+' мс';pe.style.color=lq<50?'var(--ok)':lq<150?'var(--warn)':'var(--bad)'}
 }
 function setLive(ok){$('live').classList.toggle('off',!ok);$('live').title=ok?'Данные поступают':'Нет связи с сервером'}
 
@@ -1149,11 +1940,50 @@ function eventsUI(ev){
  const el=$('pane-ev');if(el._h!==h){el.innerHTML=h;el._h=h}
 }
 let lastAl=-1;
+let alertsList=[];
 function alertsUI(a){
- a=a||[];const b=$('b-al');b.textContent=a.length;b.hidden=!a.length;
- const h=a.length?'<div class="hint" style="margin:0 2px 12px">Процесс впервые подключился к новому домену. Первые 10 минут на чистой базе — режим обучения.</div>'+a.map(x=>`<div class="alert"><div class="rw"><b>${esc(x.proc)}</b><span class="dim">${esc(x.t)}</span></div><div>→ ${esc(x.remote)}</div><div class="dim mono">${esc(x.ip)}</div></div>`).join(''):empty('ok','Всё спокойно','Новых соединений процессов с неизвестными доменами нет');
+ a=a||[];alertsList=a;const b=$('b-al');b.textContent=a.length;b.hidden=!a.length;
+ const card=(x,i)=>x.kind==='device'
+  ?`<div class="alert dev"><div class="rw"><b>Новое устройство в сети</b><span class="dim">${esc(x.t)}</span></div><div class="mono">${esc(x.ip)} · ${esc(x.mac||x.remote)}</div><div class="al-a"><button class="btn ghost sm" data-ai="${i}">Это моё</button></div></div>`
+  :`<div class="alert"><div class="rw"><b>${esc(x.proc)}</b><span class="dim">${esc(x.t)}</span></div><div>→ ${esc(x.remote)}</div><div class="dim mono">${esc(x.ip)}</div><div class="al-a"><button class="btn ghost sm" data-ai="${i}">Доверять</button></div></div>`;
+ const h=a.length?`<div class="rw" style="margin:0 2px 12px;align-items:center;gap:10px"><span class="hint" style="margin:0">Процесс впервые подключился к новому домену, либо в сети появилось новое устройство.</span><button class="btn ghost sm" data-ai="all">Очистить</button></div>`+a.map(card).join(''):empty('ok','Всё спокойно','Новых соединений и устройств нет');
  const el=$('pane-al');if(el._h!==h){el.innerHTML=h;el._h=h}
 }
+$('pane-al').addEventListener('click',async e=>{
+ const b=e.target.closest('[data-ai]');if(!b)return;
+ const x=b.dataset.ai==='all'?{all:true}:(({t,proc,remote})=>({t,proc,remote}))(alertsList[+b.dataset.ai]);
+ await post('/alerts/dismiss',x);poll()});
+/* ── вкладка «Сеть» ── */
+function qSpark(arr,color){
+ const W=150,H=30,n=arr.length;if(n<2)return '<svg class="qs" viewBox="0 0 150 30"></svg>';
+ const mx=Math.max(50,...arr.filter(v=>v!=null)),x=d3.scaleLinear([0,n-1],[0,W]),y=d3.scaleLinear([0,mx],[H-2,2]);
+ const ln=d3.line().defined(v=>v!=null).curve(d3.curveMonotoneX).x((_,i)=>x(i)).y(v=>y(v));
+ const miss=arr.map((v,i)=>v==null?`<rect x="${(x(i)-1).toFixed(1)}" y="0" width="2.5" height="${H}" fill="#ff6b81" opacity=".55"/>`:'').join('');
+ return `<svg class="qs" viewBox="0 0 ${W} ${H}">${miss}<path d="${ln(arr)||''}" fill="none" stroke="${color}" stroke-width="1.6"/></svg>`}
+function qRow(name,arr,color){
+ const ok=arr.filter(v=>v!=null),loss=arr.length?Math.round((arr.length-ok.length)/arr.length*100):0,last=arr.length?arr[arr.length-1]:undefined;
+ const avg=ok.length?Math.round(ok.reduce((p,c)=>p+c,0)/ok.length):null;
+ return `<div class="qrow"><div class="grow"><div class="rw"><span>${name}</span><b class="${last==null&&last!==undefined?'bad':''}">${last===undefined?'–':last===null?'нет ответа':Math.round(last)+' мс'}</b></div><div class="dim" style="font-size:11px">среднее ${avg==null?'–':avg+' мс'} · потери ${loss}%</div></div>${qSpark(arr,color)}</div>`}
+function devRow(v){
+ const tags=[v.role==='router'?'роутер':'',v.role==='me'?'этот Mac':'',v.new?'новое':'',v.private?'приватный MAC':''].filter(Boolean);
+ const nmv=v.name||v.host||(v.role==='router'?'Роутер':v.role==='me'?'Этот Mac':'Неизвестное устройство');
+ const c=v.role==='router'?COL.proc:v.role==='me'?'#fff':COL.lan;
+ return `<div class="row ${v.mac?'click':''}" data-mac="${esc(v.mac)}" data-name="${esc(v.name||'')}" ${v.mac?'title="Нажмите, чтобы назвать устройство"':''}><i class="dotc" style="color:${c};background:${c}"></i><div class="grow"><div class="rw"><span class="nm">${esc(nmv)}</span><span class="dim" style="font-size:11px">${v.role==='me'?'':ago(v.seen)}</span></div><div class="mono dim nm">${esc(v.ip)}${v.mac?' · '+esc(v.mac):''}</div>${tags.length?`<div class="chips" style="margin-top:4px">${tags.map(t=>`<span class="pill${t==='новое'?' add':''}">${t}</span>`).join('')}</div>`:''}</div></div>`}
+function netUI(d){
+ const el=$('pane-net');if(!d)return;
+ const q=d.quality||{},s=d.session||{in:0,out:0,since:0,now:0},mins=Math.max(1,Math.round((s.now-s.since)/60)),devs=d.lan||[];
+ let h='<div class="sec-t">Качество связи</div>'+qRow('Роутер',q.gw||[],COL.lan)+qRow('Интернет (1.1.1.1)',q.inet||[],COL.wan);
+ h+='<div class="hint" style="margin:6px 2px 0">Задержка измеряется временем TCP-рукопожатия, каждые 3 с.</div>';
+ h+=`<div class="sec-t">Трафик за сессию</div><div class="rates"><div class="rate d"><span>↓ получено</span><b>${fmtB(s.in)}</b></div><div class="rate u"><span>↑ отправлено</span><b>${fmtB(s.out)}</b></div></div><div class="dim" style="font-size:12px;margin:0 2px">за ${mins} мин работы NetGraph</div>`;
+ h+=`<div class="rw" style="margin:18px 0 8px;align-items:center"><div class="sec-t" style="margin:0">Устройства в сети · ${devs.length}</div><button class="btn ghost sm" id="lan-scan" ${d.lan_scanning?'disabled':''}>${d.lan_scanning?'Сканирую…':'Сканировать'}</button></div>`;
+ h+=devs.length?devs.map(devRow).join(''):empty('node','Устройств не найдено','Нажмите «Сканировать», чтобы опросить подсеть');
+ if(el._h!==h){const st=el.scrollTop;el.innerHTML=h;el.scrollTop=st;el._h=h}
+}
+$('pane-net').addEventListener('click',async e=>{
+ if(e.target.closest('#lan-scan')){await post('/lan/scan');poll();return}
+ const r=e.target.closest('[data-mac]');if(!r||!r.dataset.mac)return;
+ const n=prompt('Название устройства (пусто — сбросить)',r.dataset.name);
+ if(n!==null){await post('/lan/name',{mac:r.dataset.mac,name:n});poll()}});
 let hrs=24;
 async function loadHistory(){
  const el=$('pane-hist');
@@ -1171,7 +2001,8 @@ async function poll(){
  try{
   data=await (await fetch('/data')).json();setLive(true);
   const cg=$('c-geo');if(document.activeElement!==cg)cg.checked=!!data.geo_on;cg.disabled=!!data.demo;
-  hud(data);alertsUI(data.alerts);eventsUI(data.events);
+  const cn=$('c-notify');if(document.activeElement!==cn)cn.checked=!!data.notify;
+  hud(data);alertsUI(data.alerts);eventsUI(data.events);netUI(data);
   if(!paused){
    if(view==='g'){build(data);if(!firstFit&&nodes.length>1){firstFit=true;setTimeout(()=>fit(),1400)}}
    else drawMap(data);
@@ -1184,7 +2015,7 @@ details();eventsUI([]);alertsUI([]);
 const stp=$('settings');
 function syncCfg(){
  $('m-globe').classList.toggle('on',cfg.mode==='globe');$('m-flat').classList.toggle('on',cfg.mode==='flat');
- $('c-rot').checked=cfg.rotate;$('c-lbl').checked=cfg.labels;svg.classed('alllbl',cfg.labels);
+ $('c-rot').checked=cfg.rotate;$('c-lbl').checked=cfg.labels;$('c-devs').checked=cfg.devs;svg.classed('alllbl',cfg.labels);
  [1000,2000,5000].forEach(v=>$('iv-'+v).classList.toggle('on',cfg.interval===v));
  $('mapmode').textContent=cfg.mode==='globe'?'плоская карта':'3D глобус';
 }
@@ -1198,9 +2029,52 @@ $('c-geo').onchange=e=>setGeo(e.target.checked);
 [1000,2000,5000].forEach(v=>$('iv-'+v).onclick=()=>{cfg.interval=v;saveCfg();syncCfg()});
 let gwLoaded=false;
 async function loadGw(){try{const g=await (await fetch('/gateway')).json();gwLoaded=true;
- $('rt-ip').textContent=g.ip||'не определён';if(g.ip){$('rt-open').href='http://'+g.ip;$('rt-open').hidden=false}}catch(e){}}
+ if(g.ip){$('rt-host').value=g.ip;$('rt-open').href='http://'+g.ip;$('rt-open').hidden=false}}catch(e){}}
+const rtMsg=(t,c)=>{const m=$('rt-msg');m.hidden=!t;m.className='rt-msg '+(c||'');m.textContent=t||''};
+const rtLog=l=>{$('rt-logw').hidden=!(l&&l.length);$('rt-log').textContent=(l||[]).join('\n')};
+const rtReq=()=>({host:$('rt-host').value.trim(),user:$('rt-user').value,pass:$('rt-pass').value});
+async function rtCall(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json()}
+let rtBands=[];
+$('rt-connect').onclick=async()=>{
+ const b=$('rt-connect');b.disabled=true;b.textContent='Подключаюсь…';rtMsg('');$('rt-edit').hidden=true;
+ try{
+  const r=await rtCall('/router/probe',rtReq());rtLog(r.log);
+  if(!r.ok){rtMsg(r.error||'Не удалось подключиться','err');return}
+  rtBands=r.bands;
+  $('rt-bands').innerHTML=r.bands.map(x=>x.ok?`<label class="band"><input type="checkbox" data-idx="${x.idx}" ${x.idx===0?'checked':''}><span><b>${esc(x.label)}</b> · ${esc(x.ssid)}<span class="dim">пароль: <span class="pw" data-pw="${esc(x.psk)}">•••••••</span> <a class="pwt">показать</a>${x.confirmed?'':' · диапазон не подтверждён роутером'}</span></span></label>`:`<div class="band dim"><span><b>${esc(x.label)}</b> — ${esc(x.error||'недоступен')}</span></div>`).join('');
+  const b0=r.bands.find(x=>x.ok);$('rt-ssid').value=b0?b0.ssid:'';$('rt-psk').value='';
+  $('rt-edit').hidden=false;rtMsg('Подключено. Измените имя и/или пароль и нажмите «Применить».','ok');
+ }catch(e){rtMsg('Ошибка: '+e,'err')}
+ finally{b.disabled=false;b.textContent='Подключиться'}
+};
+$('rt-bands').addEventListener('click',e=>{const a=e.target.closest('.pwt');if(!a)return;e.preventDefault();
+ const pw=a.parentNode.querySelector('.pw'),shown=pw.dataset.shown==='1';pw.textContent=shown?'•••••••':pw.dataset.pw;pw.dataset.shown=shown?'0':'1';a.textContent=shown?'показать':'скрыть'});
+$('rt-apply').onclick=async()=>{
+ const bands=[...document.querySelectorAll('#rt-bands input:checked')].map(i=>+i.dataset.idx);
+ const cur=rtBands.find(x=>x.ok&&bands.includes(x.idx)),ssid=$('rt-ssid').value.trim(),psk=$('rt-psk').value;
+ const newSsid=cur&&ssid!==cur.ssid?ssid:'';
+ if(!bands.length)return rtMsg('Выберите хотя бы один диапазон','warn');
+ if(!newSsid&&!psk)return rtMsg('Нечего менять: введите новое имя или пароль','warn');
+ if(psk&&(psk.length<8||psk.length>63))return rtMsg('Пароль: от 8 до 63 символов','warn');
+ if(!confirm('Wi-Fi роутера перезапустится: устройства, подключённые по Wi-Fi (включая этот Mac, если он на Wi-Fi), на время отключатся, а затем потребуют новый пароль. Применить?'))return;
+ const b=$('rt-apply');b.disabled=true;b.textContent='Применяю… (до 30 с)';rtMsg('Отправляю настройки в роутер…');
+ try{
+  const r=await rtCall('/router/apply',{...rtReq(),bands,ssid:newSsid,psk});rtLog(r.log);
+  if(r.error)return rtMsg(r.error,'err');
+  const lines=r.results.map(x=>{const n=x.idx===0?'2.4 ГГц':'5 ГГц',st=v=>v===true?'применено':v===false?'НЕ применилось':'не удалось подтвердить';
+   return x.error?`${n}: ${x.error}`:`${n}:`+(x.ssid!==undefined?` имя — ${st(x.ssid)};`:'')+(x.psk!==undefined?` пароль — ${st(x.psk)};`:'')});
+  rtMsg(lines.join('\n'),r.ok?'ok':'warn');$('rt-msg').style.whiteSpace='pre-line';
+  if(r.ok)$('rt-psk').value='';
+ }catch(e){rtMsg('Связь с роутером оборвалась — вероятно, Wi-Fi перезапускается. Подождите минуту и нажмите «Подключиться», чтобы проверить результат.','warn')}
+ finally{b.disabled=false;b.textContent='Применить'}
+};
 function toggleSettings(on){stp.hidden=on===undefined?!stp.hidden:!on;$('cog').classList.toggle('on',!stp.hidden);if(!stp.hidden&&!gwLoaded)loadGw()}
 $('cog').onclick=()=>toggleSettings();$('st-x').onclick=()=>toggleSettings(false);
+$('c-devs').onchange=e=>{cfg.devs=e.target.checked;saveCfg();if(data&&view==='g')build(data)};
+$('c-notify').onchange=e=>post('/config',{notify:e.target.checked});
+const exp=w=>()=>{location.href='/export?fmt=csv&what='+w};
+$('ex-conns').onclick=exp('conns');$('ex-dev').onclick=exp('devices');$('ex-log').onclick=exp('log');
+$('st-help').onclick=()=>{toggleSettings(false);$('help').hidden=false};
 syncCfg();
 window.__ng={setView,select,setTab,fit,setMode,toggleSettings};
 })();
@@ -1257,6 +2131,8 @@ if __name__ == "__main__":
     else:
         threading.Thread(target=loop, daemon=True).start()
         threading.Thread(target=geo_loop, daemon=True).start()
+        threading.Thread(target=ping_loop, daemon=True).start()
+        threading.Thread(target=lan_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
     url = f"http://127.0.0.1:{a.port}"
     print("NetGraph:", url, "(Ctrl+C для выхода)")
